@@ -174,7 +174,31 @@ To ensure honest behavior by Escrow Validators:
 *   **Staking Requirement:** Validators must lock a significant security deposit of native tokens to be eligible to receive verification tasks.
 *   **Slashing Conditions:** If a validator is proven to have acted maliciously (e.g., by attesting to a fraudulent TEE report, proven via a cryptographic fraud proof), a portion or all of their staked tokens are instantaneously slashed (burned or redistributed). This economic penalty is designed to exceed any potential short-term gain from collusion.
 
-## 5. Conclusion
+---
+
+## 5. Limitations & Scope: The "Existence vs. Quality" Distinction
+
+It is crucial to delineate what TrustChain *can* and *cannot* solve. As illustrated by traditional systems (e.g., credit card chargebacks or retail return policies), disputes often arise not from *non-delivery*, but from *dissatisfaction* with the delivered good or service.
+
+### 5.1 Objective Delivery vs. Subjective Quality
+TrustChain is architected primarily to solve the **"Existence of Service"** problem (Did it happen?), not the **"Quality of Service"** problem (Was it good?).
+
+*   **What TrustChain Solves (Binary Verification):**
+    *   *Did the TEE execute the code and produce a result?* (Yes/No)
+    *   *Did the Oracle confirm the package arrived at the coordinates?* (Yes/No)
+    *   *Did the API return a 200 OK with the valid signature?* (Yes/No)
+
+*   **What TrustChain Does Not Solve (Subjective Assessment):**
+    *   *Was the AI-generated image "beautiful"?*
+    *   *Was the consulting advice "helpful"?*
+    *   *Was the physical good "authentic" or a "refurbished return"?*
+
+### 5.2 The Role of Human Arbitration
+While the core protocol focuses on cryptographic and objective proofs, the **Pluggable Verifier** architecture allows for "Human-in-the-Loop" solutions (e.g., Kleros, Aragon Court) to handle subjective disputes. However, these are higher-layer abstractions. At its base layer, TrustChain guarantees **settlement upon proof**, removing the counterparty risk of non-payment or non-delivery, but it does not replace the need for off-chain reputation or legal frameworks for qualitative disputes.
+
+---
+
+## 6. Conclusion
 The current Web3 landscape is rich in financial primitives but poor in mechanisms for real-world service exchange. TrustChain addresses this fundamental gap by introducing **Trust-as-a-Service (TaaS)** as a native blockchain primitive.
 
 By re-architecting underlying transaction data structures with typed envelopes and implementing a parallel execution environment, TrustChain provides a scalable, non-intrusive solution for securing untrusted transactions. Its modular **Pluggable Verifier Framework**, combined with an incentive-compatible economic model, creates a robust foundation for a new era of decentralized commerce, where services can be exchanged as seamlessly and securely as digital assets.
