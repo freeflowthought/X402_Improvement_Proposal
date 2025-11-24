@@ -106,13 +106,23 @@ The node's protocol parser operates as a dispatcher based on the Type ID:
 *   **Type 0x02 (Standard):** Routed directly to the Base Execution Environment (BEE) for immediate processing.
 *   **Type 0x03 (Escrow):** Decoded into the `EscrowTxData` structure. The node performs an atomic fund-lock in the BEE and creates a corresponding escrow record in the Escrow Execution Environment (EEE), routing the verification request to the specified `VerifierAddress`.
 
-### 2.5 The TaaS Lifecycle
-1.  **Initiation (Pending):** A buyer submits a `TaaS_EscrowTx`. Funds (Value) are atomically locked in a system account. EEE state becomes `PENDING_DELIVERY`.
+### 2.5 The TaaS Lifecycle: Optimistic Execution
+TrustChain employs a "Dual-Path" settlement model to balance speed and security:
+
+1.  **Initiation (Pending):** A buyer submits a `TaaS_EscrowTx`. Funds (Value) are atomically locked. EEE state becomes `PENDING_DELIVERY`.
 2.  **Off-Chain Delivery:** The seller delivers the off-chain service.
-3.  **Proof Submission (Fulfilling):** The seller submits a `TaaS_FulfillTx` containing the proof of delivery. The EEE routes this to the designated Pluggable Verifier module.
-4.  **Finalization:**
-    *   **Success:** Verifier returns true. Funds are unlocked to the seller and validator. State becomes `COMPLETED`.
-    *   **Timeout/Failure:** Verifier returns false or timeout is reached. Buyer submits `TaaS_RefundTx` to reclaim funds. State becomes `REFUNDED`.
+3.  **Path A: The Fast Path (Client Confirmation - "Gasless" Settlement):** 
+    *   **Mechanism:** The Buyer signs an off-chain, EIP-712 typed data message: `ConfirmService(EscrowID, Rating)`. This action is **gas-free** for the Buyer.
+    *   **Submission:** The Buyer transmits this digital signature to the Seller (off-chain).
+    *   **Settlement:** The Seller includes this signature in their `TaaS_FulfillTx`. The EEE validates the signature against the Buyer's address.
+    *   **Result:** Funds are *instantly* released. This "Happy Path" covers >99% of cases, reducing network load and cost.
+4.  **Path B: The Slow Path (Proof & Dispute):**
+    *   If the Buyer is unresponsive or malicious (refuses to confirm), the Seller submits a `TaaS_FulfillTx` with the Proof of Delivery (e.g., TEE attestation).
+    *   The EEE routes this to the designated Pluggable Verifier.
+    *   **Result:** The Verifier validates the proof. If true, funds are released (minus the Verifier Fee).
+5.  **Finalization:**
+    *   **Success:** Funds unlocked via Path A or Path B. State `COMPLETED`.
+    *   **Timeout/Failure:** If no confirmation and no valid proof within `TimeoutHeight`, Buyer reclaims funds. State `REFUNDED`.
 
 ## 3. Pluggable Verifier Framework
 
@@ -123,8 +133,11 @@ To solve the routing and discovery problem, TrustChain utilizes a **System Smart
 *   **Governance:** The DAO votes to "whitelist" reputable Verifier Contracts into the Registry.
 *   **Safety:** If a specific Verifier implementation is found to be buggy or compromised, the DAO can pause or delist it via the Registry without halting the entire blockchain.
 
-### 3.2 The Verification Challenge
-A core challenge is objectively proving off-chain service delivery. TrustChain addresses this by decoupling the escrow logic from the verification logic via a **Pluggable Verifier Framework**.
+### 3.2 The Verification Challenge & Hybrid Approach
+A core challenge is balancing the "Friction vs. Speed" trade-off. TrustChain addresses this by using a **Hybrid Verification Model**:
+
+*   **Optimistic Layer (Client Proof):** The primary "verifier" is the client themselves. If they attest to receiving the service, the protocol accepts this as absolute truth. This provides the "frictionless" experience of Web2 payments.
+*   **Adjudication Layer (Pluggable Verifiers):** External verifiers are only invoked as a fallback mechanism during disputes or non-cooperation. This preserves the "trustless" guarantee without imposing latency on every transaction.
 
 ### 3.3 The Standard Verifier Interface
 The framework relies on a standardized `IVerifier` interface, allowing the EEE to interact with diverse proof mechanisms uniformly.
@@ -162,17 +175,25 @@ TrustChain employs a robust cryptoeconomic model to align the incentives of all 
 > While an entity can operate both as a base-layer Blockchain Consensus Validator and an Escrow Validator simultaneously to maximize revenue, these are distinct logical roles within the protocol. An Escrow Validator is required to maintain a separate staking balance specifically bonded to their verification duties.
 
 ### 4.3 Fee Structure and Distribution
-The `VerifierFee` paid by the buyer is distributed via a protocol-level splitting mechanism upon successful transaction completion:
+### 4.3 Fee Structure: The "Honesty Incentive"
+TrustChain introduces a dynamic fee model that rewards honest cooperation and penalizes disputes. The `VerifierFee` deposited by the Buyer acts as a "Max Verification Cost".
 
-1.  **Verifier Reward (e.g., 70%):** Awarded directly to the Verifier Operator(s) that facilitated the proof. This incentivizes the operation of specialized hardware and covers gas/operational costs.
-2.  **Protocol Treasury (e.g., 20%):** Allocated to decentralized governance for core development, security audits, and ecosystem grants.
-3.  **Protocol Insurance Fund (e.g., 10%):** Automatically routed to a solvency pool. This fund acts as a backstop to reimburse users in the event of a catastrophic failure of a whitelisted Verifier Contract (e.g., a zero-day exploit in a TEE), replacing the previously proposed "Social Good Fund" to better align with protocol security.
+#### Scenario A: Fast Path (Client Confirmation)
+If the Buyer confirms receipt via the Fast Path, no heavy verification is performed.
+*   **Refund to Buyer (e.g., 80%):** The majority of the `VerifierFee` is returned to the Buyer. This creates a powerful **"Honesty Incentive"**—Buyers are financially motivated to confirm delivery quickly to recover their deposit.
+*   **Protocol Revenue (e.g., 20%):** A small portion is retained by the protocol treasury for security and development.
+
+#### Scenario B: Slow Path (Dispute/Proof)
+If the Verifier must intervene due to non-confirmation:
+*   **Verifier Reward (e.g., 80%):** The full fee is paid to the Verifier Operator to cover computation and hardware costs.
+*   **Protocol Revenue (e.g., 20%):** Retained by the protocol.
+*   **Buyer Cost:** The Buyer loses the entire `VerifierFee` refund, penalizing them for unresponsiveness if the service was actually delivered.
 
 ### 4.4 Staking and Slashing Mechanism
 To ensure honest behavior by Escrow Validators:
 
 *   **Staking Requirement:** Validators must lock a significant security deposit of native tokens to be eligible to receive verification tasks.
-*   **Slashing Conditions:** If a validator is proven to have acted maliciously (e.g., by attesting to a fraudulent TEE report, proven via a cryptographic fraud proof), a portion or all of their staked tokens are instantaneously slashed (burned or redistributed). This economic penalty is designed to exceed any potential short-term gain from collusion.
+*   **Slashing Conditions:** If a validator is proven to have acted maliciously (e.g., by attesting to a fraudulent TEE report, proven via a cryptographic fraud proof), a portion or all of their staked tokens are slashed.
 
 ---
 
