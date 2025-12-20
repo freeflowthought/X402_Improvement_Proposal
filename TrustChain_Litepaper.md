@@ -1,7 +1,7 @@
 # TrustChain: Trust as a Service (TaaS) Protocol for the Decentralized Service Economy
 
 **Status**: Draft / Proposal  
-**Version**: v0.3  
+**Version**: v0.4  
 **Date**: December 2025  
 **Author**: 0xwilsonwu (co-authored draft)  
 **Deployment Target**: Base (EVM compatible)
@@ -302,6 +302,14 @@ struct ServiceTx {
 | ARB_EVIDENCE | 0x11 | Submit evidence |
 | ARB_DECISION | 0x12 | Submit decision |
 
+### 3.1.1 Settlement Key and Hashing Rules
+
+To avoid implementation and audit ambiguity, TrustChain uses a consistent rule:
+
+- **On-chain settlement primary key**: `settlementId` (unique, non-reusable; all settle/finalize/dispute/confirm use this key)
+- **Business content hash**: `requestHash` (or `requestId`) is only for indexing/association, not a settlement primary key
+- **Receipt uniqueness**: `receiptId` uniquely identifies a UsageReceipt and must be replay-protected on-chain
+
 ### 3.2 ServiceRequest
 
 ```solidity
@@ -317,7 +325,7 @@ struct ServiceRequest {
 }
 ```
 
-`maxAmount` must not exceed the payer's locked balance. Providers should check remaining balance and authorization before service execution.
+`maxAmount` must not exceed the payer's locked balance. Default policy locks `maxAmount` on request creation; a lighter policy allows Providers to call on-chain `checkAndLock()` before execution.
 
 ### 3.3 UsageReceipt
 
@@ -334,6 +342,28 @@ struct UsageReceipt {
     bytes32 aux;          // module-specific field
 }
 ```
+
+### 3.3.1 ConfirmService (Fast Path Confirmation)
+
+Off-chain confirmation message for the fast path:
+
+```solidity
+struct ConfirmService {
+    bytes32 settlementId;  // settlement primary key
+    address payer;
+    address provider;
+    address token;
+    uint256 amount;
+    bytes32 receiptId;
+    bytes32 requestHash;   // optional: association index
+    bytes32 policyId;      // optional but strongly recommended
+    uint8 rating;          // optional: QoS score
+    uint64 deadline;       // expiry time
+    uint256 nonce;         // replay protection (must be consumed on-chain)
+}
+```
+
+ConfirmService is a **final authorization** for a specific settlement. The payer signs this EIP-712 message and the provider submits it via `settleWithConfirm(...)`. EntryPoint must verify deep binding (payer/provider/token/amount/receiptId/policyId), Settlement must consume the nonce/confirmHash, and the settlement must be neither disputed nor finalized. Once consumed on-chain, it is irreversible; revocation must go through dispute/arbitration.
 
 ### 3.4 Batch Settlement (Optional)
 
@@ -378,9 +408,8 @@ Settlement -> Provider: finalize (after challenge window)
 1. Payer deposits or locks funds
 2. Payer signs ServiceRequest
 3. Provider executes API call and generates UsageReceipt
-4. Provider submits ServiceTx(kind=SETTLE)
-5. Challenge window begins
-6. If undisputed, settlement finalizes; otherwise arbitration
+4. **Fast path**: payer signs ConfirmService -> provider calls `settleWithConfirm(...)` -> funds released immediately
+   **or slow path**: provider submits ServiceTx(kind=SETTLE) -> challenge window -> finalization/arbitration
 
 ### 4.3 E-commerce Delivery Flow (Extended)
 
@@ -469,6 +498,11 @@ Mitigations:
 2. Dynamic stake requirements
 3. Monitoring and forced top-ups
 
+**Operational constraints**:
+- Prefer stablecoin stake or apply haircuts for volatile assets
+- Stake lock/unlock timing must align with `challengeWindow`
+- `clawback/slash` trigger, window, and distribution must be explicit in interfaces and implementation
+
 ---
 
 ## 5. Arbitration Flow and State Machine
@@ -498,6 +532,8 @@ struct ArbitrationPolicy {
     uint32 evidenceMask;
 }
 ```
+
+**Parameter selection**: different industries need different fee/bond/window settings. `arbFeeBps`, `challengeWindow`, `bondWindow`, and `minBond` should be configured per module; Policy is versioned, not a global constant.
 
 ### 5.2 State Machine
 
@@ -792,8 +828,8 @@ For all tx:
 
 S3 - No double payment:
 ```
-For all request:
-  count(settle(tx) where tx.requestId = request.requestId) <= 1
+For all settlement:
+  count(finalize(s) where s.settlementId = settlement.settlementId) <= 1
 ```
 
 **Property 2: Liveness**
@@ -871,8 +907,8 @@ Mitigations:
 
 | Option | Description | Best for |
 |--------|-------------|----------|
-| **Lock on request** | Lock funds when request is created | high-value |
-| **On-chain check** | Provider calls `checkAndLock()` before execution | mid-value |
+| **Default lock** | Lock funds when request is created | high-value |
+| **Lightweight lock** | Provider calls `checkAndLock()` before execution | mid-value |
 | **Over-stake** | Provider stake covers loss | low-value, high-frequency |
 
 ```solidity
@@ -900,7 +936,7 @@ Not applicable in v0.3 (Base only). Multi-chain expansion will require dedicated
 | On-chain double spend | None | Base global state | solved |
 | Receipt double claim | Low | receiptId uniqueness | solved |
 | Request double use | Low | provider binding | solved |
-| Balance race | Medium | lock or check | solved |
+| Balance race | Medium | default lock / optional check | solved |
 | Cross-chain | N/A | out of scope | future |
 
 ### 7.5 Security and Risk Summary
@@ -910,7 +946,7 @@ Not applicable in v0.3 (Base only). Multi-chain expansion will require dedicated
 | Forged receipts | Signature checks and challenges |
 | Non-cooperation | Bonds and default outcomes |
 | Arbitrator corruption | Replaceable modules and governance |
-| Replay attacks | nonce + expiry + requestId |
+| Replay attacks | nonce + deadline + on-chain consumption (nonce or confirmHash) |
 | Data availability | content-addressed evidence |
 | Payment default | prepaid-only model |
 | Optimistic risk | stake requirements and challenge activity |
@@ -1242,10 +1278,219 @@ struct ZKEvidence {
 
 ### A.5 Oracle Mode
 
-Best for:
-- logistics delivery
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    External Data Sources                          │
+│  (Logistics API, IoT Sensors, Third-party Witnesses...)          │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+       ┌──────────┐    ┌──────────┐    ┌──────────┐
+       │ Oracle 1 │    │ Oracle 2 │    │ Oracle N │
+       │(Chainlink)│   │  (API3)  │    │ (Custom) │
+       └────┬─────┘    └────┬─────┘    └────┬─────┘
+            │               │               │
+            └───────────────┼───────────────┘
+                            │
+                     ┌──────▼──────┐
+                     │   Oracle    │
+                     │ Aggregator  │
+                     └──────┬──────┘
+                            │
+                     ┌──────▼──────┐
+                     │   Oracle    │
+                     │  Arbitrator │
+                     └──────┬──────┘
+                            │
+                     ┌──────▼──────┐
+                     │ Settlement  │
+                     └─────────────┘
+```
+
+#### Evidence Format
+
+```solidity
+struct OracleEvidence {
+    bytes32 requestId;
+    bytes32 receiptId;
+
+    // Oracle data
+    bytes32 dataHash;              // Hash of oracle-provided data
+    bytes32 dataType;              // Type identifier (e.g., "DELIVERY", "UPTIME", "PRICE")
+    bytes encodedData;             // ABI-encoded oracle response
+
+    // Oracle attestations
+    address[] oracleAddresses;     // Participating oracle nodes
+    bytes[] oracleSignatures;      // Signatures from each oracle
+    uint64[] timestamps;           // Timestamp from each oracle
+
+    // Aggregation
+    uint8 minConfirmations;        // Minimum required confirmations
+    uint8 actualConfirmations;     // Actual confirmations received
+    bytes32 aggregatedDataHash;    // Hash of aggregated result
+
+    // Metadata
+    uint64 validUntil;             // Data expiration time
+    bytes32 sourceId;              // Registered data source identifier
+}
+```
+
+#### Oracle Arbitrator Interface
+
+```solidity
+interface IOracleArbitrator is IArbitrator {
+
+    /// @notice Oracle node status
+    enum OracleStatus {
+        INACTIVE,
+        ACTIVE,
+        SUSPENDED,
+        SLASHED
+    }
+
+    /// @notice Registered oracle node
+    struct OracleNode {
+        address nodeAddress;
+        bytes32 nodeId;
+        uint256 stake;
+        uint64 registeredAt;
+        uint64 lastActiveAt;
+        OracleStatus status;
+        uint32 successCount;
+        uint32 failureCount;
+        bytes32[] supportedDataTypes;
+    }
+
+    /// @notice Data source configuration
+    struct DataSource {
+        bytes32 sourceId;
+        string endpoint;
+        bytes32[] requiredOracles;    // Specific oracles required
+        uint8 minConfirmations;
+        uint64 maxDataAge;            // Maximum age of data in seconds
+        uint16 deviationThresholdBps; // Max deviation between oracles
+    }
+
+    /// @notice Register a new oracle node
+    function registerOracle(
+        bytes32 nodeId,
+        uint256 stakeAmount,
+        bytes32[] calldata supportedDataTypes
+    ) external;
+
+    /// @notice Submit oracle attestation
+    function submitAttestation(
+        bytes32 disputeId,
+        bytes32 dataHash,
+        bytes calldata signature,
+        uint64 timestamp
+    ) external;
+
+    /// @notice Aggregate oracle responses and submit decision
+    function aggregateAndDecide(
+        bytes32 disputeId,
+        OracleEvidence calldata evidence
+    ) external;
+
+    /// @notice Verify oracle evidence validity
+    function verifyOracleEvidence(
+        OracleEvidence calldata evidence
+    ) external view returns (bool valid, string memory reason);
+
+    /// @notice Get oracle node info
+    function getOracleNode(address node) external view returns (OracleNode memory);
+
+    /// @notice Check if data source is registered
+    function isDataSourceRegistered(bytes32 sourceId) external view returns (bool);
+
+    /// @notice Slash misbehaving oracle
+    function slashOracle(address oracle, uint256 amount, bytes32 reason) external;
+}
+```
+
+#### Oracle Aggregation Logic
+
+```solidity
+contract OracleAggregator {
+
+    /// @notice Aggregation strategies
+    enum AggregationStrategy {
+        MEDIAN,           // Use median value
+        WEIGHTED_AVERAGE, // Stake-weighted average
+        THRESHOLD,        // Boolean threshold (e.g., 2/3 agree)
+        FIRST_VALID       // First valid response (for non-numeric data)
+    }
+
+    /// @notice Aggregate oracle responses
+    function aggregate(
+        bytes32[] calldata dataHashes,
+        uint256[] calldata stakes,
+        AggregationStrategy strategy
+    ) external pure returns (bytes32 result, bool valid) {
+        if (strategy == AggregationStrategy.THRESHOLD) {
+            // Count matching responses
+            uint256 maxCount = 0;
+            bytes32 mostCommon;
+
+            for (uint i = 0; i < dataHashes.length; i++) {
+                uint256 count = 0;
+                for (uint j = 0; j < dataHashes.length; j++) {
+                    if (dataHashes[i] == dataHashes[j]) count++;
+                }
+                if (count > maxCount) {
+                    maxCount = count;
+                    mostCommon = dataHashes[i];
+                }
+            }
+
+            // Require 2/3 agreement
+            valid = (maxCount * 3 >= dataHashes.length * 2);
+            result = mostCommon;
+        }
+        // ... other strategies
+    }
+
+    /// @notice Check deviation between numeric oracle responses
+    function checkDeviation(
+        uint256[] calldata values,
+        uint16 maxDeviationBps
+    ) external pure returns (bool withinThreshold) {
+        if (values.length < 2) return true;
+
+        uint256 min = values[0];
+        uint256 max = values[0];
+
+        for (uint i = 1; i < values.length; i++) {
+            if (values[i] < min) min = values[i];
+            if (values[i] > max) max = values[i];
+        }
+
+        // deviation = (max - min) / min
+        uint256 deviation = ((max - min) * 10000) / min;
+        withinThreshold = (deviation <= maxDeviationBps);
+    }
+}
+```
+
+#### Trust Assumptions
+
+| Assumption | Requirement |
+|-----------|-------------|
+| Honest majority | >= 2/3 oracle nodes honest |
+| Data source reliability | External APIs/sensors function correctly |
+| Stake sufficiency | Oracle stake covers potential damages |
+| Timeliness | Oracles respond within decisionWindow |
+
+#### Best Use Cases
+
+- Logistics delivery (courier signature confirmation)
 - IoT sensor validation
-- external API dependency
+- External API dependency (uptime monitoring)
+- Price feeds for payment conversion
+- Geographic location verification
 
 ### A.6 Mode Selection Guide
 
@@ -1326,6 +1571,20 @@ library TrustChainTypes {
         bytes32 aux;
     }
 
+    struct ConfirmService {
+        bytes32 settlementId;
+        address payer;
+        address provider;
+        address token;
+        uint256 amount;
+        bytes32 receiptId;
+        bytes32 requestHash;
+        bytes32 policyId;
+        uint8 rating;
+        uint64 deadline;
+        uint256 nonce;
+    }
+
     struct ArbitrationPolicy {
         uint64 challengeWindow;
         uint64 bondWindow;
@@ -1379,6 +1638,10 @@ contract EntryPoint is EIP712 {
         "ServiceTx(uint8 kind,bytes32 moduleId,address payer,address provider,address token,uint256 amount,uint256 nonce,uint64 deadline,bytes32 requestHash,bytes32 policyId)"
     );
 
+    bytes32 public constant CONFIRM_SERVICE_TYPEHASH = keccak256(
+        "ConfirmService(bytes32 settlementId,address payer,address provider,address token,uint256 amount,bytes32 receiptId,bytes32 requestHash,bytes32 policyId,uint8 rating,uint64 deadline,uint256 nonce)"
+    );
+
     bytes8 public constant MAGIC_PREFIX = "TRUST_V1";
 
     address public immutable settlement;
@@ -1386,6 +1649,7 @@ contract EntryPoint is EIP712 {
     address public immutable registry;
 
     mapping(address => uint256) public nonces;
+    mapping(address => uint256) public confirmNonces;
 
     event ServiceTxExecuted(
         bytes32 indexed requestHash,
@@ -1427,13 +1691,37 @@ contract EntryPoint is EIP712 {
             ISettlement(settlement).deposit(tx_.payer, tx_.token, tx_.amount);
         } else if (tx_.kind == uint8(TrustChainTypes.TxKind.SETTLE)) {
             ISettlement(settlement).settle(
-                tx_.payer, tx_.provider, tx_.token, tx_.amount, tx_.requestHash
+                tx_.payer, tx_.provider, tx_.token, tx_.amount, tx_.requestHash, tx_.policyId
             );
         }
 
         emit ServiceTxExecuted(
             tx_.requestHash, tx_.kind, tx_.payer, tx_.provider, tx_.amount
         );
+    }
+
+    function settleWithConfirm(
+        TrustChainTypes.UsageReceipt calldata receipt,
+        TrustChainTypes.ConfirmService calldata confirm,
+        bytes calldata confirmSig
+    ) external {
+        require(block.timestamp <= confirm.deadline, "Expired");
+        require(confirm.nonce == confirmNonces[confirm.payer], "Invalid nonce");
+        confirmNonces[confirm.payer]++;
+        require(confirm.receiptId == receipt.receiptId, "Receipt mismatch");
+        require(confirm.amount == receipt.amount, "Amount mismatch");
+
+        bytes32 structHash = keccak256(abi.encode(
+            CONFIRM_SERVICE_TYPEHASH,
+            confirm.settlementId, confirm.payer, confirm.provider, confirm.token,
+            confirm.amount, confirm.receiptId, confirm.requestHash, confirm.policyId,
+            confirm.rating, confirm.deadline, confirm.nonce
+        ));
+        bytes32 digest = _hashTypedDataV4(structHash);
+        address signer = ECDSA.recover(digest, confirmSig);
+        require(signer == confirm.payer, "Invalid signature");
+
+        ISettlement(settlement).settleWithConfirm(receipt, confirm);
     }
 
     function domainSeparator() external view returns (bytes32) {
@@ -1461,12 +1749,15 @@ contract Settlement is ReentrancyGuard {
 
     mapping(address => mapping(address => TrustChainTypes.EscrowAccount)) public escrows;
     mapping(bytes32 => PendingSettlement) public pendingSettlements;
+    mapping(bytes32 => bool) public settledReceipts;
 
     struct PendingSettlement {
         address payer;
         address provider;
         address token;
         uint256 amount;
+        bytes32 requestHash;
+        bytes32 policyId;
         uint64 settleTime;
         bool finalized;
     }
@@ -1483,25 +1774,51 @@ contract Settlement is ReentrancyGuard {
         address provider,
         address token,
         uint256 amount,
-        bytes32 requestHash
-    ) external nonReentrant {
+        bytes32 requestHash,
+        bytes32 policyId
+    ) external nonReentrant returns (bytes32 settlementId) {
         require(escrows[payer][token].balance >= amount, "Insufficient");
 
         escrows[payer][token].balance -= amount;
         escrows[payer][token].locked += amount;
 
-        pendingSettlements[requestHash] = PendingSettlement({
+        settlementId = keccak256(abi.encode(
+            payer, provider, token, amount, requestHash, block.number
+        ));
+        require(pendingSettlements[settlementId].payer == address(0), "Settlement exists");
+        pendingSettlements[settlementId] = PendingSettlement({
             payer: payer,
             provider: provider,
             token: token,
             amount: amount,
+            requestHash: requestHash,
+            policyId: policyId,
             settleTime: uint64(block.timestamp),
             finalized: false
         });
     }
 
-    function finalize(bytes32 requestHash) external nonReentrant {
-        PendingSettlement storage ps = pendingSettlements[requestHash];
+    function settleWithConfirm(
+        TrustChainTypes.UsageReceipt calldata receipt,
+        TrustChainTypes.ConfirmService calldata confirm
+    ) external nonReentrant returns (bytes32 settlementId) {
+        require(msg.sender == entryPoint, "Only entryPoint");
+        require(!settledReceipts[receipt.receiptId], "Receipt already settled");
+        settledReceipts[receipt.receiptId] = true;
+
+        settlementId = confirm.settlementId;
+        require(pendingSettlements[settlementId].payer == address(0), "Settlement exists");
+        require(confirm.amount == receipt.amount, "Amount mismatch");
+
+        uint256 fee = (confirm.amount * protocolFeeBps) / 10000;
+        uint256 providerAmount = confirm.amount - fee;
+
+        escrows[confirm.payer][confirm.token].balance -= confirm.amount;
+        IERC20(confirm.token).safeTransfer(confirm.provider, providerAmount);
+    }
+
+    function finalize(bytes32 settlementId) external nonReentrant {
+        PendingSettlement storage ps = pendingSettlements[settlementId];
         require(!ps.finalized, "Already finalized");
 
         uint256 fee = (ps.amount * protocolFeeBps) / 10000;
@@ -1513,8 +1830,8 @@ contract Settlement is ReentrancyGuard {
         ps.finalized = true;
     }
 
-    function advanceWithdraw(bytes32 requestHash) external nonReentrant {
-        PendingSettlement storage ps = pendingSettlements[requestHash];
+    function advanceWithdraw(bytes32 settlementId) external nonReentrant {
+        PendingSettlement storage ps = pendingSettlements[settlementId];
         require(msg.sender == ps.provider, "Only provider");
 
         uint256 stake = IStakePool(stakePool).getStake(ps.provider, ps.token);
@@ -1527,7 +1844,384 @@ contract Settlement is ReentrancyGuard {
 }
 ```
 
-### B.4 Deployment Script
+### B.4 Complete Interface Definitions
+
+#### ISettlement Interface
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+interface ISettlement {
+
+    /// @notice Escrow account state
+    struct EscrowAccount {
+        uint256 balance;      // Available balance
+        uint256 locked;       // Locked for pending settlements
+        uint256 nonce;        // Account nonce
+    }
+
+    /// @notice Pending settlement state
+    struct PendingSettlement {
+        address payer;
+        address provider;
+        address token;
+        uint256 amount;
+        bytes32 requestHash;
+        uint64 settleTime;
+        uint64 challengeDeadline;
+        bytes32 policyId;
+        bool finalized;
+        bool disputed;
+    }
+
+    // ============ Deposit & Withdraw ============
+
+    /// @notice Deposit tokens to escrow
+    function deposit(address payer, address token, uint256 amount) external;
+
+    /// @notice Withdraw available balance
+    function withdraw(address token, uint256 amount) external;
+
+    /// @notice Get escrow balance
+    function getBalance(address payer, address token) external view returns (uint256 available, uint256 locked);
+
+    // ============ Settlement ============
+
+    /// @notice Initiate settlement (locks funds, starts challenge window)
+    function settle(
+        address payer,
+        address provider,
+        address token,
+        uint256 amount,
+        bytes32 requestHash,
+        bytes32 policyId
+    ) external returns (bytes32 settlementId);
+
+    /// @notice Fast-path settlement (confirm signature + receipt)
+    function settleWithConfirm(
+        TrustChainTypes.UsageReceipt calldata receipt,
+        TrustChainTypes.ConfirmService calldata confirm
+    ) external returns (bytes32 settlementId);
+
+    /// @notice Finalize settlement after challenge window
+    function finalize(bytes32 settlementId) external;
+
+    /// @notice Batch finalize multiple settlements
+    function batchFinalize(bytes32[] calldata settlementIds) external;
+
+    /// @notice Get pending settlement details
+    function getPendingSettlement(bytes32 settlementId) external view returns (PendingSettlement memory);
+
+    // ============ Optimistic Settlement ============
+
+    /// @notice Provider advance withdrawal (requires stake)
+    function advanceWithdraw(bytes32 settlementId) external;
+
+    /// @notice Clawback advanced funds on successful challenge
+    function clawback(bytes32 settlementId, uint256 amount) external;
+
+    // ============ Dispute Integration ============
+
+    /// @notice Mark settlement as disputed (called by Arbitration)
+    function markDisputed(bytes32 settlementId) external;
+
+    /// @notice Execute arbitration decision
+    function executeDecision(
+        bytes32 settlementId,
+        uint16 payerShareBps,
+        uint16 providerShareBps
+    ) external;
+
+    // ============ Admin ============
+
+    /// @notice Set protocol fee
+    function setProtocolFee(uint16 feeBps) external;
+
+    /// @notice Set EntryPoint address
+    function setEntryPoint(address entryPoint) external;
+
+    /// @notice Emergency pause
+    function pause() external;
+
+    /// @notice Unpause
+    function unpause() external;
+}
+```
+
+#### IStakePool Interface
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+interface IStakePool {
+
+    /// @notice Stake state for a provider
+    struct StakeInfo {
+        uint256 total;        // Total staked amount
+        uint256 locked;       // Locked for pending settlements
+        uint256 slashed;      // Cumulative slashed amount
+        uint64 lastStakeTime; // Last stake modification time
+        uint64 unlockTime;    // Cooldown unlock time
+    }
+
+    // ============ Staking ============
+
+    /// @notice Stake tokens
+    function stake(address token, uint256 amount) external;
+
+    /// @notice Request unstake (starts cooldown)
+    function requestUnstake(address token, uint256 amount) external;
+
+    /// @notice Complete unstake after cooldown
+    function unstake(address token, uint256 amount) external;
+
+    /// @notice Get stake info
+    function getStake(address provider, address token) external view returns (uint256 available, uint256 locked);
+
+    /// @notice Get full stake info
+    function getStakeInfo(address provider, address token) external view returns (StakeInfo memory);
+
+    // ============ Locking ============
+
+    /// @notice Lock stake for optimistic settlement
+    function lockStake(address provider, address token, uint256 amount) external;
+
+    /// @notice Unlock stake after settlement finalized
+    function unlockStake(address provider, address token, uint256 amount) external;
+
+    /// @notice Check if provider has sufficient stake
+    function hasSufficientStake(
+        address provider,
+        address token,
+        uint256 requiredAmount,
+        uint256 multiplier
+    ) external view returns (bool);
+
+    // ============ Slashing ============
+
+    /// @notice Slash provider stake (called by Arbitration)
+    function slash(
+        address provider,
+        address token,
+        uint256 amount,
+        bytes32 reason
+    ) external returns (uint256 actualSlashed);
+
+    /// @notice Distribute slashed funds
+    function distributeSlash(
+        uint256 amount,
+        address payer,
+        address arbitrator,
+        uint16 payerBps,
+        uint16 arbBps,
+        uint16 treasuryBps,
+        uint16 burnBps
+    ) external;
+
+    // ============ Parameters ============
+
+    /// @notice Get minimum stake requirement
+    function minStake(address token) external view returns (uint256);
+
+    /// @notice Get unstake cooldown period
+    function unstakeCooldown() external view returns (uint64);
+
+    // ============ Admin ============
+
+    /// @notice Set minimum stake
+    function setMinStake(address token, uint256 amount) external;
+
+    /// @notice Set unstake cooldown
+    function setUnstakeCooldown(uint64 cooldown) external;
+
+    /// @notice Add authorized slasher (e.g., Arbitration contract)
+    function addSlasher(address slasher) external;
+}
+```
+
+#### IRegistry Interface
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+interface IRegistry {
+
+    /// @notice Module registration info
+    struct ModuleInfo {
+        bytes32 moduleId;
+        string name;
+        string version;
+        address implementation;
+        bytes32 specHash;        // Hash of module specification
+        uint64 registeredAt;
+        uint64 updatedAt;
+        bool active;
+        uint8 riskTier;          // 1-5 risk classification
+        string auditReportUri;
+    }
+
+    /// @notice Arbitration policy info
+    struct PolicyInfo {
+        bytes32 policyId;
+        TrustChainTypes.ArbitrationPolicy policy;
+        bool active;
+        uint64 createdAt;
+    }
+
+    // ============ Module Registry ============
+
+    /// @notice Register a new module
+    function registerModule(
+        bytes32 moduleId,
+        string calldata name,
+        string calldata version,
+        address implementation,
+        bytes32 specHash,
+        uint8 riskTier,
+        string calldata auditReportUri
+    ) external;
+
+    /// @notice Update module (creates new version)
+    function updateModule(
+        bytes32 moduleId,
+        string calldata newVersion,
+        address newImplementation,
+        bytes32 newSpecHash
+    ) external;
+
+    /// @notice Deactivate module
+    function deactivateModule(bytes32 moduleId) external;
+
+    /// @notice Get module info
+    function getModule(bytes32 moduleId) external view returns (ModuleInfo memory);
+
+    /// @notice Check if module is active
+    function isModuleActive(bytes32 moduleId) external view returns (bool);
+
+    // ============ Policy Registry ============
+
+    /// @notice Register arbitration policy
+    function registerPolicy(
+        bytes32 policyId,
+        TrustChainTypes.ArbitrationPolicy calldata policy
+    ) external;
+
+    /// @notice Get policy
+    function getPolicy(bytes32 policyId) external view returns (TrustChainTypes.ArbitrationPolicy memory);
+
+    /// @notice Check if policy is active
+    function isPolicyActive(bytes32 policyId) external view returns (bool);
+
+    // ============ Arbitrator Registry ============
+
+    /// @notice Register arbitrator for a mode
+    function registerArbitrator(
+        uint8 arbMode,
+        address arbitrator
+    ) external;
+
+    /// @notice Get arbitrator for mode
+    function getArbitrator(uint8 arbMode) external view returns (address);
+
+    // ============ Access Control ============
+
+    /// @notice Check if address is authorized module admin
+    function isModuleAdmin(bytes32 moduleId, address account) external view returns (bool);
+
+    /// @notice Grant module admin role
+    function grantModuleAdmin(bytes32 moduleId, address account) external;
+}
+```
+
+#### IArbitration Interface
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+interface IArbitration {
+
+    /// @notice Dispute info
+    struct DisputeInfo {
+        bytes32 disputeId;
+        bytes32 settlementId;
+        bytes32 receiptId;
+        TrustChainTypes.DisputeState state;
+        address challenger;
+        address challenged;
+        uint256 payerBond;
+        uint256 providerBond;
+        uint64 openedAt;
+        uint64 bondDeadline;
+        uint64 evidenceDeadline;
+        uint64 decisionDeadline;
+        bytes32 policyId;
+        bytes32[] evidenceHashes;
+    }
+
+    // ============ Dispute Lifecycle ============
+
+    /// @notice Open a dispute
+    function openDispute(
+        bytes32 settlementId,
+        bytes32 receiptId,
+        bytes32 policyId,
+        bytes calldata evidence
+    ) external payable returns (bytes32 disputeId);
+
+    /// @notice Submit bond
+    function submitBond(bytes32 disputeId) external payable;
+
+    /// @notice Submit evidence
+    function submitEvidence(
+        bytes32 disputeId,
+        bytes32 evidenceHash,
+        string calldata evidenceUri
+    ) external;
+
+    /// @notice Submit arbitration decision (called by arbitrator)
+    function submitDecision(
+        bytes32 disputeId,
+        IArbitrator.Decision calldata decision,
+        bytes calldata proof
+    ) external;
+
+    /// @notice Force finalize after grace period
+    function forceFinalize(bytes32 disputeId) external;
+
+    // ============ Queries ============
+
+    /// @notice Get dispute info
+    function getDispute(bytes32 disputeId) external view returns (DisputeInfo memory);
+
+    /// @notice Get dispute state
+    function getDisputeState(bytes32 disputeId) external view returns (TrustChainTypes.DisputeState);
+
+    /// @notice Check if settlement has active dispute
+    function hasActiveDispute(bytes32 settlementId) external view returns (bool);
+
+    // ============ Evidence ============
+
+    /// @notice Get evidence hashes for dispute
+    function getEvidenceHashes(bytes32 disputeId) external view returns (bytes32[] memory);
+
+    /// @notice Verify evidence hash
+    function verifyEvidenceHash(bytes32 disputeId, bytes32 evidenceHash) external view returns (bool);
+
+    // ============ Admin ============
+
+    /// @notice Set grace period
+    function setGracePeriod(uint64 period) external;
+
+    /// @notice Emergency resolve dispute
+    function emergencyResolve(bytes32 disputeId, IArbitrator.Outcome outcome) external;
+}
+```
+
+### B.5 Deployment Script
 
 ```solidity
 // SPDX-License-Identifier: MIT
@@ -1560,6 +2254,741 @@ contract DeployTrustChain is Script {
         console.log("Arbitration:", address(arbitration));
     }
 }
+```
+
+### B.6 ProviderRegistry Contract
+
+The ProviderRegistry manages provider onboarding, capability declaration, and access control.
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      ProviderRegistry                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐          │
+│  │  Provider   │    │  Service    │    │  Capability │          │
+│  │  Profiles   │    │   Types     │    │  Proofs     │          │
+│  └──────┬──────┘    └──────┬──────┘    └──────┬──────┘          │
+│         │                  │                  │                  │
+│         └──────────────────┼──────────────────┘                  │
+│                            │                                     │
+│                     ┌──────▼──────┐                              │
+│                     │   Access    │                              │
+│                     │   Control   │                              │
+│                     └──────┬──────┘                              │
+│                            │                                     │
+│         ┌──────────────────┼──────────────────┐                  │
+│         ▼                  ▼                  ▼                  │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐          │
+│  │  Whitelist  │    │  Blacklist  │    │  Rate Limit │          │
+│  └─────────────┘    └─────────────┘    └─────────────┘          │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Interface Definition
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+interface IProviderRegistry {
+
+    /// @notice Provider status
+    enum ProviderStatus {
+        UNREGISTERED,
+        PENDING,          // Awaiting verification
+        ACTIVE,
+        SUSPENDED,
+        BLACKLISTED
+    }
+
+    /// @notice Provider profile
+    struct ProviderProfile {
+        address providerAddress;
+        bytes32 providerId;
+        string name;
+        string metadataUri;         // IPFS/Arweave URI for extended metadata
+        ProviderStatus status;
+        uint64 registeredAt;
+        uint64 lastActiveAt;
+        uint256 totalSettled;       // Cumulative settled amount
+        uint256 disputeCount;
+        uint256 disputeLossCount;
+        bytes32[] serviceTypes;     // Supported service types
+        bytes32[] moduleIds;        // Registered modules
+    }
+
+    /// @notice Service type definition
+    struct ServiceType {
+        bytes32 typeId;
+        string name;
+        string description;
+        bytes32 specHash;           // Service specification hash
+        uint8 requiredArbMode;      // Required arbitration mode
+        uint256 minStakeRequired;   // Minimum stake for this service type
+        bool active;
+    }
+
+    /// @notice Capability proof (e.g., TEE attestation, ZK credential)
+    struct CapabilityProof {
+        bytes32 proofId;
+        bytes32 capabilityType;     // "TEE_SGX", "ZK_PROVER", "ORACLE_NODE", etc.
+        bytes proofData;            // Encoded proof data
+        uint64 issuedAt;
+        uint64 expiresAt;
+        address issuer;             // Proof issuer (e.g., Intel for SGX)
+        bool verified;
+    }
+
+    // ============ Registration ============
+
+    /// @notice Register as a provider
+    function registerProvider(
+        string calldata name,
+        string calldata metadataUri,
+        bytes32[] calldata serviceTypes
+    ) external payable returns (bytes32 providerId);
+
+    /// @notice Update provider profile
+    function updateProfile(
+        string calldata name,
+        string calldata metadataUri
+    ) external;
+
+    /// @notice Add supported service type
+    function addServiceType(bytes32 serviceTypeId) external;
+
+    /// @notice Remove supported service type
+    function removeServiceType(bytes32 serviceTypeId) external;
+
+    /// @notice Submit capability proof
+    function submitCapabilityProof(
+        bytes32 capabilityType,
+        bytes calldata proofData,
+        uint64 expiresAt
+    ) external returns (bytes32 proofId);
+
+    // ============ Queries ============
+
+    /// @notice Get provider profile
+    function getProvider(address provider) external view returns (ProviderProfile memory);
+
+    /// @notice Get provider by ID
+    function getProviderById(bytes32 providerId) external view returns (ProviderProfile memory);
+
+    /// @notice Check if provider is active
+    function isProviderActive(address provider) external view returns (bool);
+
+    /// @notice Check if provider supports service type
+    function supportsServiceType(address provider, bytes32 serviceTypeId) external view returns (bool);
+
+    /// @notice Get provider's capability proofs
+    function getCapabilityProofs(address provider) external view returns (CapabilityProof[] memory);
+
+    /// @notice Verify capability proof is valid
+    function hasValidCapability(address provider, bytes32 capabilityType) external view returns (bool);
+
+    // ============ Service Type Management ============
+
+    /// @notice Register a new service type
+    function registerServiceType(
+        bytes32 typeId,
+        string calldata name,
+        string calldata description,
+        bytes32 specHash,
+        uint8 requiredArbMode,
+        uint256 minStakeRequired
+    ) external;
+
+    /// @notice Get service type info
+    function getServiceType(bytes32 typeId) external view returns (ServiceType memory);
+
+    // ============ Access Control ============
+
+    /// @notice Suspend provider
+    function suspendProvider(address provider, string calldata reason) external;
+
+    /// @notice Reactivate suspended provider
+    function reactivateProvider(address provider) external;
+
+    /// @notice Blacklist provider
+    function blacklistProvider(address provider, string calldata reason) external;
+
+    /// @notice Check if provider is blacklisted
+    function isBlacklisted(address provider) external view returns (bool);
+
+    // ============ Rate Limiting ============
+
+    /// @notice Get provider's settlement limit
+    function getSettlementLimit(address provider) external view returns (uint256 daily, uint256 perTx);
+
+    /// @notice Check if provider can settle amount
+    function canSettle(address provider, uint256 amount) external view returns (bool);
+
+    /// @notice Record settlement (called by Settlement contract)
+    function recordSettlement(address provider, uint256 amount) external;
+
+    // ============ Reputation Integration ============
+
+    /// @notice Get provider reputation score (0-10000)
+    function getReputationScore(address provider) external view returns (uint16);
+
+    /// @notice Record dispute outcome (called by Arbitration)
+    function recordDisputeOutcome(address provider, bool won) external;
+}
+```
+
+#### Provider Onboarding Flow
+
+```
+┌─────────┐                    ┌──────────────────┐                    ┌───────────┐
+│ Provider│                    │ ProviderRegistry │                    │ StakePool │
+└────┬────┘                    └────────┬─────────┘                    └─────┬─────┘
+     │                                  │                                    │
+     │  1. registerProvider()           │                                    │
+     │  + registration fee              │                                    │
+     │─────────────────────────────────►│                                    │
+     │                                  │                                    │
+     │  2. Validate inputs              │                                    │
+     │  Create profile (PENDING)        │                                    │
+     │                                  │                                    │
+     │  3. stake()                      │                                    │
+     │───────────────────────────────────────────────────────────────────────►
+     │                                  │                                    │
+     │                                  │  4. Check stake meets minimum      │
+     │                                  │◄────────────────────────────────────
+     │                                  │                                    │
+     │  5. submitCapabilityProof()      │                                    │
+     │  (optional, for TEE/ZK)          │                                    │
+     │─────────────────────────────────►│                                    │
+     │                                  │                                    │
+     │  6. Verify proof                 │                                    │
+     │  Activate provider               │                                    │
+     │                                  │                                    │
+     │  7. ProviderActivated event      │                                    │
+     │◄─────────────────────────────────│                                    │
+     │                                  │                                    │
+     │  Provider can now accept         │                                    │
+     │  ServiceRequests                 │                                    │
+```
+
+#### Tier-Based Limits
+
+Providers are assigned tiers based on stake and reputation, which determine their operational limits:
+
+| Tier | Min Stake | Max Tx | Daily Limit | Required Reputation |
+|------|-----------|--------|-------------|---------------------|
+| Starter | 100 USDC | 100 USDC | 1,000 USDC | N/A (new) |
+| Basic | 1,000 USDC | 500 USDC | 10,000 USDC | >= 5000 |
+| Standard | 5,000 USDC | 2,000 USDC | 50,000 USDC | >= 7000 |
+| Premium | 25,000 USDC | 10,000 USDC | 250,000 USDC | >= 8500 |
+| Enterprise | 100,000 USDC | Unlimited | Unlimited | >= 9500 |
+
+```solidity
+/// @notice Tier configuration
+struct TierConfig {
+    uint256 minStake;
+    uint256 maxPerTx;
+    uint256 dailyLimit;
+    uint16 minReputation;
+}
+
+/// @notice Get provider's current tier
+function getProviderTier(address provider) external view returns (uint8 tier, TierConfig memory config);
+```
+
+### B.7 Watcher Network Specification
+
+Watchers monitor settlements and can challenge fraudulent claims. A healthy watcher network is essential for protocol security.
+
+#### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       Watcher Network                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐     │
+│  │ Watcher 1 │  │ Watcher 2 │  │ Watcher 3 │  │ Watcher N │     │
+│  │ (Full)    │  │ (Light)   │  │ (Full)    │  │ (Light)   │     │
+│  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘     │
+│        │              │              │              │            │
+│        └──────────────┼──────────────┼──────────────┘            │
+│                       │              │                           │
+│                ┌──────▼──────┐┌──────▼──────┐                    │
+│                │  Event      ││  Challenge  │                    │
+│                │  Indexer    ││  Coordinator│                    │
+│                └──────┬──────┘└──────┬──────┘                    │
+│                       │              │                           │
+│                       └──────┬───────┘                           │
+│                              │                                   │
+│                       ┌──────▼──────┐                            │
+│                       │  Watcher    │                            │
+│                       │  Registry   │                            │
+│                       └─────────────┘                            │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Watcher Types
+
+| Type | Responsibility | Stake Requirement | Reward Share |
+|------|---------------|-------------------|--------------|
+| **Full Watcher** | Indexes all settlements, validates receipts, initiates challenges | 10,000 USDC | 70% of challenger reward |
+| **Light Watcher** | Monitors specific providers or modules, reports to Full Watchers | 1,000 USDC | 20% of challenger reward |
+| **Delegated Watcher** | Receives delegation from token holders, shares rewards | Variable | Based on delegation |
+
+#### Interface Definition
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+interface IWatcherRegistry {
+
+    /// @notice Watcher status
+    enum WatcherStatus {
+        INACTIVE,
+        ACTIVE,
+        SUSPENDED,
+        EXITING     // In unbonding period
+    }
+
+    /// @notice Watcher type
+    enum WatcherType {
+        FULL,
+        LIGHT,
+        DELEGATED
+    }
+
+    /// @notice Watcher profile
+    struct WatcherProfile {
+        address watcherAddress;
+        bytes32 watcherId;
+        WatcherType watcherType;
+        WatcherStatus status;
+        uint256 stake;
+        uint256 delegatedStake;
+        uint64 registeredAt;
+        uint64 lastActiveAt;
+        uint32 successfulChallenges;
+        uint32 failedChallenges;
+        uint256 totalRewards;
+        bytes32[] watchedModules;    // Modules this watcher monitors
+        address[] watchedProviders;  // Specific providers to monitor
+    }
+
+    /// @notice Challenge record
+    struct ChallengeRecord {
+        bytes32 challengeId;
+        bytes32 settlementId;
+        address watcher;
+        uint64 timestamp;
+        bool successful;
+        uint256 reward;
+    }
+
+    // ============ Registration ============
+
+    /// @notice Register as a watcher
+    function registerWatcher(
+        WatcherType watcherType,
+        bytes32[] calldata watchedModules
+    ) external payable returns (bytes32 watcherId);
+
+    /// @notice Add stake
+    function addStake(uint256 amount) external;
+
+    /// @notice Request unstake (starts unbonding)
+    function requestUnstake(uint256 amount) external;
+
+    /// @notice Complete unstake after unbonding period
+    function unstake() external;
+
+    /// @notice Update watched modules
+    function updateWatchedModules(bytes32[] calldata modules) external;
+
+    /// @notice Add specific provider to watch list
+    function addWatchedProvider(address provider) external;
+
+    // ============ Delegation ============
+
+    /// @notice Delegate stake to a watcher
+    function delegate(address watcher, uint256 amount) external;
+
+    /// @notice Undelegate stake
+    function undelegate(address watcher, uint256 amount) external;
+
+    /// @notice Get total delegated to watcher
+    function getDelegatedStake(address watcher) external view returns (uint256);
+
+    // ============ Challenge ============
+
+    /// @notice Report suspicious settlement
+    function reportSuspicious(
+        bytes32 settlementId,
+        bytes calldata evidence
+    ) external returns (bytes32 reportId);
+
+    /// @notice Record challenge outcome (called by Arbitration)
+    function recordChallengeOutcome(
+        bytes32 challengeId,
+        address watcher,
+        bool successful,
+        uint256 reward
+    ) external;
+
+    // ============ Queries ============
+
+    /// @notice Get watcher profile
+    function getWatcher(address watcher) external view returns (WatcherProfile memory);
+
+    /// @notice Check if watcher is active
+    function isWatcherActive(address watcher) external view returns (bool);
+
+    /// @notice Get active watchers for a module
+    function getWatchersForModule(bytes32 moduleId) external view returns (address[] memory);
+
+    /// @notice Get challenge history
+    function getChallengeHistory(address watcher) external view returns (ChallengeRecord[] memory);
+
+    // ============ Coverage Metrics ============
+
+    /// @notice Get watcher coverage for a settlement amount
+    function getWatcherCoverage(uint256 amount) external view returns (
+        uint8 watcherCount,
+        uint256 totalStake,
+        bool sufficientCoverage
+    );
+
+    /// @notice Minimum watchers required for settlement amount
+    function requiredWatchers(uint256 amount) external view returns (uint8);
+
+    // ============ Rewards ============
+
+    /// @notice Claim accumulated rewards
+    function claimRewards() external returns (uint256);
+
+    /// @notice Get pending rewards
+    function pendingRewards(address watcher) external view returns (uint256);
+}
+```
+
+#### Watcher Incentive Model
+
+```
+Challenge Reward Distribution:
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    Slashed Amount (S)                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐        │
+│  │ Payer (50%)   │  │Challenger(20%)│  │ Protocol(30%) │        │
+│  └───────────────┘  └───────┬───────┘  └───────────────┘        │
+│                             │                                    │
+│                             ▼                                    │
+│                  ┌─────────────────────┐                         │
+│                  │  Challenger Reward  │                         │
+│                  │    Distribution     │                         │
+│                  └─────────┬───────────┘                         │
+│                            │                                     │
+│           ┌────────────────┼────────────────┐                    │
+│           ▼                ▼                ▼                    │
+│    ┌────────────┐   ┌────────────┐   ┌────────────┐             │
+│    │ Initiator  │   │ Full       │   │ Light      │             │
+│    │ (40%)      │   │ Watchers   │   │ Watchers   │             │
+│    │            │   │ (40%)      │   │ (20%)      │             │
+│    └────────────┘   └────────────┘   └────────────┘             │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Coverage Requirements
+
+High-value settlements require minimum watcher coverage:
+
+| Settlement Amount | Min Watchers | Min Total Stake |
+|------------------|--------------|-----------------|
+| < 1,000 USDC | 1 | 5,000 USDC |
+| 1,000 - 10,000 USDC | 2 | 20,000 USDC |
+| 10,000 - 100,000 USDC | 3 | 100,000 USDC |
+| > 100,000 USDC | 5 | 500,000 USDC |
+
+If coverage is insufficient, settlement enters extended challenge window (2x normal).
+
+### B.8 Event Log Definitions
+
+Complete event definitions for off-chain indexing and monitoring:
+
+```solidity
+// ============ EntryPoint Events ============
+
+event ServiceTxExecuted(
+    bytes32 indexed requestHash,
+    uint8 indexed kind,
+    address indexed payer,
+    address provider,
+    uint256 amount,
+    bytes32 moduleId,
+    bytes32 policyId
+);
+
+event NonceUsed(address indexed payer, uint256 nonce);
+
+// ============ Settlement Events ============
+
+event Deposited(
+    address indexed payer,
+    address indexed token,
+    uint256 amount,
+    uint256 newBalance
+);
+
+event Withdrawn(
+    address indexed payer,
+    address indexed token,
+    uint256 amount,
+    uint256 newBalance
+);
+
+event SettlementInitiated(
+    bytes32 indexed settlementId,
+    bytes32 indexed requestHash,
+    address indexed payer,
+    address provider,
+    address token,
+    uint256 amount,
+    uint64 challengeDeadline
+);
+
+event SettlementFinalized(
+    bytes32 indexed settlementId,
+    address indexed provider,
+    uint256 providerAmount,
+    uint256 protocolFee
+);
+
+event AdvanceWithdrawn(
+    bytes32 indexed settlementId,
+    address indexed provider,
+    uint256 advanceAmount,
+    uint256 lockedStake
+);
+
+event Clawback(
+    bytes32 indexed settlementId,
+    address indexed provider,
+    uint256 clawbackAmount
+);
+
+// ============ Arbitration Events ============
+
+event DisputeOpened(
+    bytes32 indexed disputeId,
+    bytes32 indexed settlementId,
+    address indexed challenger,
+    address challenged,
+    bytes32 policyId
+);
+
+event BondSubmitted(
+    bytes32 indexed disputeId,
+    address indexed party,
+    uint256 amount
+);
+
+event EvidenceSubmitted(
+    bytes32 indexed disputeId,
+    address indexed submitter,
+    bytes32 evidenceHash,
+    string evidenceUri
+);
+
+event DecisionSubmitted(
+    bytes32 indexed disputeId,
+    IArbitrator.Outcome outcome,
+    uint16 payerShareBps,
+    uint16 providerShareBps,
+    bytes32 reasonHash
+);
+
+event DisputeFinalized(
+    bytes32 indexed disputeId,
+    IArbitrator.Outcome outcome,
+    uint256 payerAmount,
+    uint256 providerAmount,
+    uint256 slashedAmount
+);
+
+event ForceFinalized(
+    bytes32 indexed disputeId,
+    IArbitrator.Outcome outcome,
+    address indexed caller
+);
+
+// ============ StakePool Events ============
+
+event Staked(
+    address indexed provider,
+    address indexed token,
+    uint256 amount,
+    uint256 totalStake
+);
+
+event UnstakeRequested(
+    address indexed provider,
+    address indexed token,
+    uint256 amount,
+    uint64 unlockTime
+);
+
+event Unstaked(
+    address indexed provider,
+    address indexed token,
+    uint256 amount,
+    uint256 remainingStake
+);
+
+event StakeLocked(
+    address indexed provider,
+    address indexed token,
+    uint256 amount,
+    bytes32 settlementId
+);
+
+event StakeUnlocked(
+    address indexed provider,
+    address indexed token,
+    uint256 amount,
+    bytes32 settlementId
+);
+
+event Slashed(
+    address indexed provider,
+    address indexed token,
+    uint256 amount,
+    bytes32 reason
+);
+
+event SlashDistributed(
+    uint256 totalAmount,
+    uint256 payerAmount,
+    uint256 arbAmount,
+    uint256 treasuryAmount,
+    uint256 burnAmount
+);
+
+// ============ ProviderRegistry Events ============
+
+event ProviderRegistered(
+    address indexed provider,
+    bytes32 indexed providerId,
+    string name
+);
+
+event ProviderActivated(
+    address indexed provider,
+    bytes32 indexed providerId
+);
+
+event ProviderSuspended(
+    address indexed provider,
+    string reason
+);
+
+event ProviderBlacklisted(
+    address indexed provider,
+    string reason
+);
+
+event ServiceTypeAdded(
+    address indexed provider,
+    bytes32 indexed serviceTypeId
+);
+
+event CapabilityProofSubmitted(
+    address indexed provider,
+    bytes32 indexed proofId,
+    bytes32 capabilityType
+);
+
+event ReputationUpdated(
+    address indexed provider,
+    uint16 oldScore,
+    uint16 newScore
+);
+
+// ============ WatcherRegistry Events ============
+
+event WatcherRegistered(
+    address indexed watcher,
+    bytes32 indexed watcherId,
+    IWatcherRegistry.WatcherType watcherType
+);
+
+event WatcherStakeChanged(
+    address indexed watcher,
+    uint256 oldStake,
+    uint256 newStake
+);
+
+event SuspiciousReported(
+    bytes32 indexed reportId,
+    bytes32 indexed settlementId,
+    address indexed watcher
+);
+
+event ChallengeRecorded(
+    bytes32 indexed challengeId,
+    address indexed watcher,
+    bool successful,
+    uint256 reward
+);
+
+event RewardsClaimed(
+    address indexed watcher,
+    uint256 amount
+);
+
+event DelegationChanged(
+    address indexed delegator,
+    address indexed watcher,
+    uint256 amount,
+    bool isDelegation  // true = delegate, false = undelegate
+);
+
+// ============ Registry Events ============
+
+event ModuleRegistered(
+    bytes32 indexed moduleId,
+    string name,
+    string version,
+    address implementation
+);
+
+event ModuleUpdated(
+    bytes32 indexed moduleId,
+    string newVersion,
+    address newImplementation
+);
+
+event ModuleDeactivated(
+    bytes32 indexed moduleId
+);
+
+event PolicyRegistered(
+    bytes32 indexed policyId,
+    uint8 arbMode
+);
+
+event ArbitratorRegistered(
+    uint8 indexed arbMode,
+    address arbitrator
+);
 ```
 
 ---
@@ -1602,7 +3031,382 @@ struct EvidenceRecord {
 
 ---
 
-## Appendix D: Glossary
+## Appendix D: Merkle Batch Settlement
+
+### D.1 Batch Settlement Architecture
+
+For high-frequency, low-value transactions (e.g., API calls), individual on-chain settlements are cost-prohibitive. Merkle batch settlement aggregates multiple receipts into a single on-chain commitment.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Batch Settlement Flow                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  Off-chain (Provider)                     On-chain                │
+│  ┌─────────────────────┐                                         │
+│  │ Receipt 1           │                                         │
+│  │ Receipt 2           │                                         │
+│  │ Receipt 3           │     Batch                               │
+│  │ ...                 │ ──────────►  ┌──────────────────┐       │
+│  │ Receipt N           │              │  ReceiptBatch    │       │
+│  └─────────────────────┘              │  - batchId       │       │
+│           │                           │  - merkleRoot    │       │
+│           ▼                           │  - totalAmount   │       │
+│  ┌─────────────────────┐              │  - receiptCount  │       │
+│  │   Merkle Tree       │              └────────┬─────────┘       │
+│  │                     │                       │                 │
+│  │       Root          │                       ▼                 │
+│  │      /    \         │              Challenge Window           │
+│  │    H01    H23       │                       │                 │
+│  │   /  \   /  \       │                       ▼                 │
+│  │  H0  H1 H2  H3      │              ┌─────────────────┐        │
+│  │  |   |  |   |       │              │ Dispute (if any)│        │
+│  │  R0  R1 R2  R3      │              │ - merkleProof   │        │
+│  └─────────────────────┘              │ - receiptData   │        │
+│                                       └─────────────────┘        │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### D.2 Data Structures
+
+```solidity
+/// @notice Batch settlement on-chain commitment
+struct ReceiptBatch {
+    bytes32 batchId;
+    bytes32 merkleRoot;        // Root of receipt Merkle tree
+    address provider;
+    address token;
+    uint256 totalAmount;       // Sum of all receipt amounts
+    uint32 receiptCount;       // Number of receipts in batch
+    uint64 fromTime;           // Earliest receipt timestamp
+    uint64 toTime;             // Latest receipt timestamp
+    uint64 submittedAt;
+    bytes32 policyId;
+}
+
+/// @notice Individual receipt for Merkle proof verification
+struct MerkleReceipt {
+    bytes32 receiptId;
+    bytes32 requestId;
+    address payer;
+    uint256 amount;
+    uint64 timestamp;
+    bytes32 payloadHash;
+    bytes32 responseHash;
+}
+
+/// @notice Merkle proof for single receipt dispute
+struct MerkleProof {
+    bytes32[] proof;           // Sibling hashes
+    uint256 index;             // Leaf index in tree
+    MerkleReceipt receipt;     // The disputed receipt
+}
+```
+
+### D.3 Batch Settlement Contract
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+
+contract BatchSettlement {
+
+    mapping(bytes32 => ReceiptBatch) public batches;
+    mapping(bytes32 => mapping(bytes32 => bool)) public disputedReceipts; // batchId => receiptId => disputed
+
+    uint32 public constant MAX_BATCH_SIZE = 10000;
+    uint64 public constant MIN_BATCH_INTERVAL = 1 hours;
+
+    event BatchSubmitted(
+        bytes32 indexed batchId,
+        address indexed provider,
+        bytes32 merkleRoot,
+        uint256 totalAmount,
+        uint32 receiptCount
+    );
+
+    event ReceiptDisputed(
+        bytes32 indexed batchId,
+        bytes32 indexed receiptId,
+        address indexed challenger
+    );
+
+    /// @notice Submit a batch of receipts
+    function submitBatch(
+        ReceiptBatch calldata batch,
+        bytes calldata providerSignature
+    ) external returns (bytes32 batchId) {
+        require(batch.receiptCount <= MAX_BATCH_SIZE, "Batch too large");
+        require(batch.toTime - batch.fromTime >= MIN_BATCH_INTERVAL, "Interval too short");
+
+        // Verify provider signature
+        bytes32 batchHash = keccak256(abi.encode(batch));
+        address signer = ECDSA.recover(batchHash, providerSignature);
+        require(signer == batch.provider, "Invalid signature");
+
+        batchId = keccak256(abi.encodePacked(
+            batch.provider,
+            batch.merkleRoot,
+            batch.fromTime,
+            batch.toTime
+        ));
+
+        batches[batchId] = batch;
+
+        // Lock payer funds proportionally
+        _lockPayerFunds(batch);
+
+        emit BatchSubmitted(
+            batchId,
+            batch.provider,
+            batch.merkleRoot,
+            batch.totalAmount,
+            batch.receiptCount
+        );
+    }
+
+    /// @notice Dispute a specific receipt within a batch
+    function disputeReceipt(
+        bytes32 batchId,
+        MerkleProof calldata proof
+    ) external {
+        ReceiptBatch storage batch = batches[batchId];
+        require(batch.batchId != bytes32(0), "Batch not found");
+
+        // Verify Merkle proof
+        bytes32 leaf = keccak256(abi.encode(proof.receipt));
+        require(
+            MerkleProof.verify(proof.proof, batch.merkleRoot, leaf),
+            "Invalid Merkle proof"
+        );
+
+        // Verify receipt not already disputed
+        require(
+            !disputedReceipts[batchId][proof.receipt.receiptId],
+            "Already disputed"
+        );
+
+        disputedReceipts[batchId][proof.receipt.receiptId] = true;
+
+        // Open individual dispute
+        IArbitration(arbitration).openDispute(
+            batchId,
+            proof.receipt.receiptId,
+            batch.policyId,
+            abi.encode(proof)
+        );
+
+        emit ReceiptDisputed(batchId, proof.receipt.receiptId, msg.sender);
+    }
+
+    /// @notice Finalize batch after challenge window
+    function finalizeBatch(bytes32 batchId) external {
+        ReceiptBatch storage batch = batches[batchId];
+        require(batch.batchId != bytes32(0), "Batch not found");
+
+        // Check challenge window passed
+        uint64 challengeDeadline = batch.submittedAt + IRegistry(registry)
+            .getPolicy(batch.policyId).challengeWindow;
+        require(block.timestamp > challengeDeadline, "Challenge window active");
+
+        // Calculate disputed amount
+        uint256 disputedAmount = _calculateDisputedAmount(batchId);
+        uint256 settleAmount = batch.totalAmount - disputedAmount;
+
+        // Settle undisputed amount
+        ISettlement(settlement).finalizeBatch(
+            batch.provider,
+            batch.token,
+            settleAmount
+        );
+    }
+
+    /// @notice Generate Merkle tree off-chain (reference implementation)
+    function computeMerkleRoot(
+        MerkleReceipt[] memory receipts
+    ) external pure returns (bytes32) {
+        require(receipts.length > 0, "Empty receipts");
+
+        // Compute leaf hashes
+        bytes32[] memory leaves = new bytes32[](receipts.length);
+        for (uint i = 0; i < receipts.length; i++) {
+            leaves[i] = keccak256(abi.encode(receipts[i]));
+        }
+
+        // Build tree bottom-up
+        while (leaves.length > 1) {
+            bytes32[] memory nextLevel = new bytes32[]((leaves.length + 1) / 2);
+            for (uint i = 0; i < leaves.length; i += 2) {
+                if (i + 1 < leaves.length) {
+                    nextLevel[i / 2] = keccak256(abi.encodePacked(
+                        leaves[i] < leaves[i + 1] ? leaves[i] : leaves[i + 1],
+                        leaves[i] < leaves[i + 1] ? leaves[i + 1] : leaves[i]
+                    ));
+                } else {
+                    nextLevel[i / 2] = leaves[i];
+                }
+            }
+            leaves = nextLevel;
+        }
+
+        return leaves[0];
+    }
+}
+```
+
+### D.4 Partial Dispute Resolution
+
+When individual receipts within a batch are disputed:
+
+```
+Batch Dispute Resolution:
+
+┌────────────────────────────────────────────────────────────────┐
+│                    Batch of 1000 Receipts                       │
+│                    Total: 10,000 USDC                           │
+├────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌────────────────┐  │
+│  │ Undisputed      │  │ Disputed #42    │  │ Disputed #789  │  │
+│  │ 998 receipts    │  │ 50 USDC         │  │ 30 USDC        │  │
+│  │ 9,920 USDC      │  │ → Arbitration   │  │ → Arbitration  │  │
+│  └────────┬────────┘  └────────┬────────┘  └───────┬────────┘  │
+│           │                    │                    │           │
+│           ▼                    ▼                    ▼           │
+│   Settles normally      Held pending          Held pending      │
+│   after challenge       arbitration           arbitration       │
+│   window                                                        │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
+```
+
+| Scenario | Action |
+|----------|--------|
+| No disputes | Entire batch settles after challenge window |
+| Single receipt disputed | Disputed amount held; rest settles |
+| Multiple receipts disputed | Each disputed amount held separately |
+| >10% of batch disputed | Extended challenge window (2x) |
+| Provider loses dispute | Slashing from stake pool |
+
+---
+
+## Appendix E: Gas Cost Analysis
+
+### E.1 Gas Estimates by Operation
+
+Based on Base (L2) gas costs. Estimates assume typical contract sizes and storage patterns.
+
+| Operation | Gas (estimated) | Cost @ 0.01 gwei | Notes |
+|-----------|----------------|------------------|-------|
+| **Deposit** | 65,000 | ~$0.001 | ERC20 transfer + storage |
+| **Withdraw** | 45,000 | ~$0.001 | ERC20 transfer + storage update |
+| **Single Settlement** | 120,000 | ~$0.002 | Full settlement flow |
+| **Batch Submit (1000 receipts)** | 150,000 | ~$0.002 | Merkle root only |
+| **Batch Finalize** | 80,000 | ~$0.001 | No disputes |
+| **Open Dispute** | 180,000 | ~$0.003 | Create dispute + bond |
+| **Submit Evidence** | 95,000 | ~$0.002 | Store evidence hash |
+| **Submit Decision** | 140,000 | ~$0.002 | Arbitrator decision |
+| **Force Finalize** | 160,000 | ~$0.003 | Timeout resolution |
+| **Stake** | 70,000 | ~$0.001 | Provider staking |
+| **Unstake Request** | 55,000 | ~$0.001 | Start cooldown |
+| **Slash** | 180,000 | ~$0.003 | Slash + distribute |
+| **Register Provider** | 200,000 | ~$0.003 | Full registration |
+| **Register Watcher** | 150,000 | ~$0.002 | Watcher registration |
+
+### E.2 Cost Comparison: Single vs Batch Settlement
+
+```
+Cost Analysis: 1000 API calls @ $0.01 each = $10 total
+
+Single Settlement (per call):
+  - Gas per settlement: 120,000
+  - Total gas: 120,000 × 1000 = 120,000,000
+  - Cost @ 0.01 gwei: ~$2.00
+  - Overhead: 20% of transaction value
+
+Batch Settlement:
+  - Batch submit: 150,000
+  - Batch finalize: 80,000
+  - Total gas: 230,000
+  - Cost @ 0.01 gwei: ~$0.004
+  - Overhead: 0.04% of transaction value
+
+Savings: 99.8%
+```
+
+### E.3 Break-Even Analysis
+
+When does individual settlement make sense vs batching?
+
+```
+Single Settlement Cost: C_single = gas_single × gasPrice
+Batch Settlement Cost: C_batch = (gas_submit + gas_finalize) / N
+
+Break-even: C_single = C_batch
+N = (gas_submit + gas_finalize) / gas_single
+N = 230,000 / 120,000
+N ≈ 2
+```
+
+**Recommendation**: Batch settlement is cost-effective for > 2 receipts.
+
+### E.4 Dispute Cost Analysis
+
+Full dispute resolution costs:
+
+| Party | Action | Gas | Cost |
+|-------|--------|-----|------|
+| **Challenger** | Open dispute | 180,000 | ~$0.003 |
+| **Challenger** | Submit bond | (included) | - |
+| **Provider** | Submit bond | 65,000 | ~$0.001 |
+| **Challenger** | Submit evidence | 95,000 | ~$0.002 |
+| **Provider** | Submit evidence | 95,000 | ~$0.002 |
+| **Arbitrator** | Submit decision | 140,000 | ~$0.002 |
+| **System** | Execute decision | 160,000 | ~$0.003 |
+| **Total** | | 735,000 | ~$0.013 |
+
+**Note**: Bond amounts (not gas) are the primary dispute cost. Gas is negligible on L2.
+
+### E.5 Scaling Projections
+
+| Daily Volume | Settlement Strategy | Est. Daily Gas Cost |
+|-------------|---------------------|---------------------|
+| 1,000 txns | Individual | ~$2.00 |
+| 1,000 txns | Batch (hourly) | ~$0.10 |
+| 10,000 txns | Individual | ~$20.00 |
+| 10,000 txns | Batch (hourly) | ~$0.60 |
+| 100,000 txns | Individual | ~$200.00 |
+| 100,000 txns | Batch (hourly) | ~$5.80 |
+| 1,000,000 txns | Individual | ~$2,000.00 |
+| 1,000,000 txns | Batch (hourly) | ~$58.00 |
+
+### E.6 Optimization Strategies
+
+| Strategy | Gas Savings | Trade-off |
+|----------|------------|-----------|
+| **Batch settlements** | 95-99% | Delayed finality |
+| **Merkle proofs** | 90%+ for disputes | Complexity |
+| **Calldata compression** | 20-40% | Off-chain processing |
+| **Storage packing** | 10-30% | Code complexity |
+| **EIP-4844 blobs** | 80%+ for data | Base support pending |
+
+### E.7 L2 vs L1 Cost Comparison
+
+| Chain | Avg Gas Price | Settlement Cost | Notes |
+|-------|--------------|-----------------|-------|
+| **Base** | 0.001-0.01 gwei | ~$0.002 | Primary deployment target |
+| **Arbitrum** | 0.01-0.1 gwei | ~$0.01 | Alternative L2 |
+| **Optimism** | 0.001-0.01 gwei | ~$0.002 | Alternative L2 |
+| **Ethereum L1** | 20-100 gwei | ~$5-25 | Not recommended |
+
+**Recommendation**: Deploy on Base for 1000x cost reduction vs L1.
+
+---
+
+## Appendix F: Glossary
 
 | Term | Definition |
 |------|------------|

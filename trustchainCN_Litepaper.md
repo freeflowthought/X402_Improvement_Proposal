@@ -1,9 +1,9 @@
 # TrustChain：面向去中心化服务经济的信任即服务 (TaaS) 协议
 
 **状态**: 草案 / 提案  
-**版本**: v0.3  
+**版本**: v0.4  
 **日期**: 2025年12月  
-**作者**: 0xwilsonwu（联合讨论稿）  
+**作者**: 0xwilsonwu  
 **部署目标**: Base（EVM 兼容）
 
 ---
@@ -48,7 +48,9 @@ TrustChain 提出一种不修改底层共识的**应用层信任协议**，通�
 - [A. 仲裁模块技术规范](#附录-a-仲裁模块技术规范)
 - [B. 核心合约参考实现](#附录-b-核心合约参考实现)
 - [C. 数据可用性方案](#附录-c-数据可用性方案)
-- [D. 术语表](#附录-d-术语表)
+- [D. Merkle 批量结算](#附录-d-merkle-批量结算)
+- [E. Gas 成本分析](#附录-e-gas-成本分析)
+- [F. 术语表](#附录-f-术语表)
 
 ---
 
@@ -317,6 +319,14 @@ struct ServiceTx {
 | ARB_EVIDENCE | 0x11 | 提交证据 |
 | ARB_DECISION | 0x12 | 裁决提交 |
 
+### 3.1.1 结算主键与摘要规范
+
+为减少实现与审计歧义，协议层采用统一规则：
+
+- **链上结算主键**：`settlementId`（唯一、不可复用，所有 settle/finalize/dispute/confirm 均以此为主键）
+- **业务内容摘要**：`requestHash`（或 `requestId`）仅作为关联索引，不作为结算主键
+- **收据唯一性**：`receiptId` 唯一标识 UsageReceipt，链上需防重放
+
 ### 3.2 ServiceRequest（服务请求）
 
 ```solidity
@@ -332,7 +342,7 @@ struct ServiceRequest {
 }
 ```
 
-`maxAmount` 必须不超过付款方已锁定的预付余额。服务方应在链下执行前检查可用余额与授权额度。
+`maxAmount` 必须不超过付款方已锁定的预付余额。默认策略是在创建请求时锁定 `maxAmount`；轻量策略允许 Provider 在执行前调用链上 `checkAndLock()` 做即时锁定。
 
 ### 3.3 UsageReceipt（服务收据）
 
@@ -349,6 +359,31 @@ struct UsageReceipt {
     bytes32 aux;          // 模块自定义字段
 }
 ```
+
+### 3.3.1 ConfirmService（快速路径确认）
+
+用于快速路径的链下确认消息：
+
+```solidity
+struct ConfirmService {
+    bytes32 settlementId;  // 结算主键
+    address payer;
+    address provider;
+    address token;
+    uint256 amount;
+    bytes32 receiptId;
+    bytes32 requestHash;   // 可选：仅用于关联索引
+    bytes32 policyId;      // 可选但强烈建议
+    uint8 rating;          // 可选：服务质量评分 (0-100)
+    uint64 deadline;       // 过期时间（替代 timestamp）
+    uint256 nonce;         // 防止重放（链上必须消费）
+}
+```
+
+ConfirmService 是对某一笔结算的**最终授权**。Payer 使用 EIP-712 签署此消息，Provider 通过 `settleWithConfirm(...)` 提交签名与收据。EntryPoint 验证签名后，Settlement 立即释放资金并**消费 nonce/confirmHash**，跳过挑战期。
+链上必须记录并消费 nonce，可采用 `confirmNonce` 严格递增或 `confirmDigest` 一次性消费两种方式之一。
+
+规范化消息体要求与 ServiceTx 同等级别的深度绑定；ConfirmService 一旦上链消费不可撤销，若需撤销必须走 dispute/arb 流程。
 
 ### 3.4 批量结算（可选）
 
@@ -380,7 +415,7 @@ struct ReceiptBatch {
 
 ### 4.1 预付托管模型（唯一支持）
 
-TrustChain 只支持预付/锁仓模式。付款方需先在 Settlement 合约中存入余额或锁定额度，服务方仅能在该额度内结算。若余额不足，服务必须暂停或要求充值。
+TrustChain 只支持预付/锁仓模式。付款方需先在 Settlement 合约中存入余额或锁定额度，服务方仅能在该额度内结算。默认策略是在创建 ServiceRequest 时锁定 `maxAmount`；轻量策略允许 Provider 在执行前链上 `checkAndLock()`，用于中频场景。若余额不足，服务必须暂停或要求充值。
 
 ```
 ┌─────────┐                    ┌─────────────┐                    ┌──────────┐
@@ -407,21 +442,69 @@ TrustChain 只支持预付/锁仓模式。付款方需先在 Settlement 合约�
      │                                │───────────────────────────────►│
 ```
 
-### 4.2 API 计费流程（典型场景）
+### 4.2 双路径结算模型（乐观执行）
+
+TrustChain 采用"双路径"结算模型，平衡速度与安全性：
+
+**路径 A：快速路径（客户端确认 - Payer 无需上链）**
+
+这是覆盖 >99% 正常情况的"快乐路径"：
+
+1. **链下确认**：Payer 签署链下 EIP-712 类型化数据消息：
+   ```solidity
+   struct ConfirmService {
+       bytes32 settlementId;
+       address payer;
+       address provider;
+       address token;
+       uint256 amount;
+       bytes32 receiptId;
+       bytes32 requestHash;   // 可选：关联索引
+       bytes32 policyId;      // 可选但强烈建议
+       uint8 rating;          // 可选：服务质量评分
+       uint64 deadline;
+       uint256 nonce;
+   }
+   ```
+   Payer 不需要发链上交易，仅需链下签名。
+
+2. **签名传输**：Payer 将此数字签名传输给 Provider（链下，如 HTTP 响应头）。
+
+3. **即时结算**：Provider 调用 `settleWithConfirm(receipt, confirm, confirmSig)`。EntryPoint 验证签名字段一致、nonce 被消费、未 disputed/未 finalized，随后立即释放资金。
+
+4. **结果**：资金**瞬间释放**，无需等待挑战期。这减少了网络负载和成本。
+
+**路径 B：慢速路径（证明与争议）**
+
+如果 Payer 未响应或拒绝确认：
+
+1. Provider 提交 `ServiceTx(kind=SETTLE)`，包含 `UsageReceipt` 和可选的交付证明（如 TEE 认证、Oracle 数据）。
+
+2. 进入挑战期（challengeWindow），期间 Payer 或 Watcher 可发起争议。
+
+3. 若无争议，挑战期结束后自动结算；若有争议，进入仲裁流程。
+
+**设计优势**：
+
+- **零摩擦体验**：快速路径提供 Web2 支付的无摩擦体验，同时保持链上可执行性
+- **成本优化**：大部分交易通过链下确认完成，显著降低链上负载（附录 E 的 Gas 数据支撑了批量与快速路径的设计选择）
+- **安全保证**：慢速路径保留"无须信任"的保证，作为争议时的后备机制
+
+### 4.3 API 计费流程（典型场景）
 
 1. Payer 预存余额或锁定额度
 2. Payer 签署 ServiceRequest
 3. Provider 完成 API 调用，生成 UsageReceipt
-4. Provider 提交 ServiceTx(kind=SETTLE)（从已锁定余额中扣除）
-5. 进入挑战期（challengeWindow）
-6. 无争议则结算；有争议进入仲裁
+4. **快速路径**：Payer 链下签署 ConfirmService → Provider 调用 `settleWithConfirm(...)` → 瞬间结算
+   **或慢速路径**：Provider 提交 ServiceTx(kind=SETTLE) → 挑战期 → 结算
+5. 若有争议，进入仲裁流程
 
-### 4.3 电商交付流程（扩展场景）
+### 4.4 电商交付流程（扩展场景）
 
 - 以物流签名、第三方见证或预言机证明作为 responseHash 的来源
 - 允许多阶段交付与分批结算
 
-### 4.4 乐观结算（Withdraw-then-Slash）
+### 4.5 乐观结算（Withdraw-then-Slash）
 
 为解决 API 服务的流动性痛点，协议允许在足额质押前提下提前回款：
 
@@ -522,6 +605,11 @@ arbBps > 50 / 1500 ≈ 3.3%
 2. 动态质押要求（根据价格波动调整 k）
 3. 质押价值监控 + 强制补仓机制
 
+**工程约束（必须可执行）**：
+- 质押资产建议使用稳定币，或对波动资产设置折扣率（haircut）
+- stake 锁定/解锁时序需与 `challengeWindow` 对齐，避免提前释放
+- `clawback/slash` 的触发者、触发窗口与分配比例需在接口与实现中显式定义
+
 ---
 
 ## 5. 仲裁流程与状态机
@@ -551,6 +639,8 @@ struct ArbitrationPolicy {
     uint32 evidenceMask;       // 证据类型要求
 }
 ```
+
+**参数选择建议**：不同模块/行业的风险结构差异很大，`arbFeeBps`、`bondWindow`、`challengeWindow`、`minBond` 等应按场景配置（例如 API 计费偏短窗口与高频挑战、电商偏长窗口与更高保证金）。Policy 不是静态常量，而是可版本化、可按业务调参的策略集合。
 
 ### 5.2 状态机
 
@@ -872,12 +962,12 @@ TA-O3: Oracle 响应时间 < decisionWindow
 ```
 
 **S3 - 无双重支付**
-> 同一笔 ServiceRequest 的资金不会被结算两次。
+> 同一笔结算（`settlementId`）或收据（`receiptId`）不会被结算两次。
 
 形式化：
 ```
-∀ req ∈ ServiceRequest:
-  |{settle(tx) : tx.requestId = req.requestId}| ≤ 1
+∀ s ∈ Settlement:
+  |{finalize(s) : s.settlementId}| ≤ 1
 ```
 
 #### 属性 2：Liveness（活性）
@@ -998,12 +1088,12 @@ T6: Provider B 结算失败！（余额不足）
 
 | 方案 | 描述 | 适用场景 |
 |------|------|----------|
-| **锁定机制** | 发起请求时锁定余额，未结算则解锁 | 高价值交易 |
-| **即时验证** | Provider 在执行前调用链上 `checkAndLock()` | 中等价值 |
+| **默认策略** | 发起请求时锁定余额，未结算则解锁 | 高价值交易 |
+| **轻量策略** | Provider 在执行前调用链上 `checkAndLock()` | 中等价值 |
 | **超额质押** | Provider 质押覆盖潜在损失 | 低价值高频 |
 
 ```solidity
-// 推荐：请求时锁定（可作为 Settlement 或 RequestRegistry 的一部分）
+// 默认策略：请求时锁定（可作为 Settlement 或 RequestRegistry 的一部分）
 function createRequest(
     bytes32 requestId,
     address token,
@@ -1036,7 +1126,7 @@ function createRequest(
 | **跨链锁定** | 通过桥接协议同步锁定状态 |
 | **主链结算** | 所有最终结算汇总到主链 |
 
-当前版本（v0.3）仅支持 Base 单链，跨链双花不适用；未来多链扩展需专门设计。
+当前版本（v0.4）仅支持 Base 单链，跨链双花不适用；未来多链扩展需专门设计。
 
 #### 双花防护总结
 
@@ -1045,7 +1135,7 @@ function createRequest(
 | 传统双花（链上） | 无 | Base 共识 + 单一全局状态 | 已解决 |
 | 收据双花 | 低 | receiptId 唯一性检查 | 已解决 |
 | 请求双用 | 低 | requestId + provider 绑定 | 已解决 |
-| 余额竞争 | 中 | 请求时锁定 / 链上检查锁定 | 已解决 |
+| 余额竞争 | 中 | 默认锁定 / 可选链上检查锁定 | 已解决 |
 | 跨链双花 | N/A | 当前单链，不适用 | 未来版本 |
 
 ### 7.5 安全性与风险总结
@@ -1055,7 +1145,7 @@ function createRequest(
 | 伪造收据 | 通过签名校验与挑战机制防止 |
 | 拒绝配合 | 保证金与默认裁决惩罚不配合方 |
 | 仲裁腐败 | 可切换仲裁模块与阈值治理 |
-| 重放攻击 | nonce + expiry + requestId |
+| 重放攻击 | nonce + deadline + 链上消费（nonce 或 confirmHash） |
 | 数据可用性 | 证据以内容寻址存储 |
 | 付款跑路 | 仅支持预付锁仓，批量结算只能消费已锁定余额 |
 | 乐观结算风险 | 依赖质押充足与挑战活跃度，需明确 minStakeMultiple 与 advanceRate 上限 |
@@ -1525,14 +1615,23 @@ struct ZKEvidence {
 #### 架构
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    External Data Source                  │
-│  (物流 API、IoT 传感器、第三方见证...)                    │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                    外部数据源                                    │
+│  (物流 API、IoT 传感器、第三方见证...)                           │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+       ┌──────────┐    ┌──────────┐    ┌──────────┐
+       │ Oracle 1 │    │ Oracle 2 │    │ Oracle N │
+       │(Chainlink)│   │  (API3)  │    │ (Custom) │
+       └────┬─────┘    └────┬─────┘    └────┬─────┘
+            │               │               │
+            └───────────────┼───────────────┘
                            │
                     ┌──────▼──────┐
-                    │   Oracle    │ (Chainlink / API3)
-                    │   Network   │
+                     │   Oracle    │
+                     │ Aggregator  │
                     └──────┬──────┘
                            │
                     ┌──────▼──────┐
@@ -1545,11 +1644,187 @@ struct ZKEvidence {
                     └─────────────┘
 ```
 
-#### 适用场景
+#### 证据格式
+
+```solidity
+struct OracleEvidence {
+    bytes32 requestId;
+    bytes32 receiptId;
+
+    // Oracle 数据
+    bytes32 dataHash;              // Oracle 提供数据的哈希
+    bytes32 dataType;              // 类型标识符（如 "DELIVERY", "UPTIME", "PRICE"）
+    bytes encodedData;             // ABI 编码的 Oracle 响应
+
+    // Oracle 证明
+    address[] oracleAddresses;     // 参与的 Oracle 节点
+    bytes[] oracleSignatures;      // 每个 Oracle 的签名
+    uint64[] timestamps;           // 每个 Oracle 的时间戳
+
+    // 聚合
+    uint8 minConfirmations;        // 所需最小确认数
+    uint8 actualConfirmations;     // 实际收到的确认数
+    bytes32 aggregatedDataHash;    // 聚合结果的哈希
+
+    // 元数据
+    uint64 validUntil;             // 数据过期时间
+    bytes32 sourceId;              // 注册的数据源标识符
+}
+```
+
+#### Oracle 仲裁者接口
+
+```solidity
+interface IOracleArbitrator is IArbitrator {
+
+    /// @notice Oracle 节点状态
+    enum OracleStatus {
+        INACTIVE,
+        ACTIVE,
+        SUSPENDED,
+        SLASHED
+    }
+
+    /// @notice 注册的 Oracle 节点
+    struct OracleNode {
+        address nodeAddress;
+        bytes32 nodeId;
+        uint256 stake;
+        uint64 registeredAt;
+        uint64 lastActiveAt;
+        OracleStatus status;
+        uint32 successCount;
+        uint32 failureCount;
+        bytes32[] supportedDataTypes;
+    }
+
+    /// @notice 数据源配置
+    struct DataSource {
+        bytes32 sourceId;
+        string endpoint;
+        bytes32[] requiredOracles;    // 所需的特定 Oracle
+        uint8 minConfirmations;
+        uint64 maxDataAge;            // 数据的最大年龄（秒）
+        uint16 deviationThresholdBps; // Oracle 之间的最大偏差
+    }
+
+    /// @notice 注册新的 Oracle 节点
+    function registerOracle(
+        bytes32 nodeId,
+        uint256 stakeAmount,
+        bytes32[] calldata supportedDataTypes
+    ) external;
+
+    /// @notice 提交 Oracle 证明
+    function submitAttestation(
+        bytes32 disputeId,
+        bytes32 dataHash,
+        bytes calldata signature,
+        uint64 timestamp
+    ) external;
+
+    /// @notice 聚合 Oracle 响应并提交裁决
+    function aggregateAndDecide(
+        bytes32 disputeId,
+        OracleEvidence calldata evidence
+    ) external;
+
+    /// @notice 验证 Oracle 证据有效性
+    function verifyOracleEvidence(
+        OracleEvidence calldata evidence
+    ) external view returns (bool valid, string memory reason);
+
+    /// @notice 获取 Oracle 节点信息
+    function getOracleNode(address node) external view returns (OracleNode memory);
+
+    /// @notice 检查数据源是否已注册
+    function isDataSourceRegistered(bytes32 sourceId) external view returns (bool);
+
+    /// @notice 罚没行为不当的 Oracle
+    function slashOracle(address oracle, uint256 amount, bytes32 reason) external;
+}
+```
+
+#### Oracle 聚合逻辑
+
+```solidity
+contract OracleAggregator {
+
+    /// @notice 聚合策略
+    enum AggregationStrategy {
+        MEDIAN,           // 使用中位数
+        WEIGHTED_AVERAGE, // 质押加权平均
+        THRESHOLD,        // 布尔阈值（如 2/3 同意）
+        FIRST_VALID       // 第一个有效响应（用于非数值数据）
+    }
+
+    /// @notice 聚合 Oracle 响应
+    function aggregate(
+        bytes32[] calldata dataHashes,
+        uint256[] calldata stakes,
+        AggregationStrategy strategy
+    ) external pure returns (bytes32 result, bool valid) {
+        if (strategy == AggregationStrategy.THRESHOLD) {
+            // 统计匹配的响应
+            uint256 maxCount = 0;
+            bytes32 mostCommon;
+
+            for (uint i = 0; i < dataHashes.length; i++) {
+                uint256 count = 0;
+                for (uint j = 0; j < dataHashes.length; j++) {
+                    if (dataHashes[i] == dataHashes[j]) count++;
+                }
+                if (count > maxCount) {
+                    maxCount = count;
+                    mostCommon = dataHashes[i];
+                }
+            }
+
+            // 要求 2/3 同意
+            valid = (maxCount * 3 >= dataHashes.length * 2);
+            result = mostCommon;
+        }
+        // ... 其他策略
+    }
+
+    /// @notice 检查数值 Oracle 响应之间的偏差
+    function checkDeviation(
+        uint256[] calldata values,
+        uint16 maxDeviationBps
+    ) external pure returns (bool withinThreshold) {
+        if (values.length < 2) return true;
+
+        uint256 min = values[0];
+        uint256 max = values[0];
+
+        for (uint i = 1; i < values.length; i++) {
+            if (values[i] < min) min = values[i];
+            if (values[i] > max) max = values[i];
+        }
+
+        // 偏差 = (max - min) / min
+        uint256 deviation = ((max - min) * 10000) / min;
+        withinThreshold = (deviation <= maxDeviationBps);
+    }
+}
+```
+
+#### 信任假设
+
+| 假设 | 要求 |
+|------|------|
+| 诚实多数 | >= 2/3 Oracle 节点诚实 |
+| 数据源可靠性 | 外部 API/传感器正常工作 |
+| 质押充足 | Oracle 质押覆盖潜在损失 |
+| 及时性 | Oracle 在 decisionWindow 内响应 |
+
+#### 最佳用例
 
 - 物流交付（快递签收确认）
-- IoT 服务（传感器数据验证）
-- 外部 API 依赖（第三方服务状态）
+- IoT 传感器验证
+- 外部 API 依赖（正常运行时间监控）
+- 支付转换的价格源
+- 地理位置验证
 
 ### A.6 仲裁模式选择指南
 
@@ -1630,6 +1905,20 @@ library TrustChainTypes {
         uint64 nonce;
         bytes32 aux;
     }
+
+    struct ConfirmService {
+        bytes32 settlementId;
+        address payer;
+        address provider;
+        address token;
+        uint256 amount;
+        bytes32 receiptId;
+        bytes32 requestHash;
+        bytes32 policyId;
+        uint8 rating;
+        uint64 deadline;
+        uint256 nonce;
+    }
     
     struct ArbitrationPolicy {
         uint64 challengeWindow;
@@ -1684,6 +1973,10 @@ contract EntryPoint is EIP712 {
     bytes32 public constant SERVICE_TX_TYPEHASH = keccak256(
         "ServiceTx(uint8 kind,bytes32 moduleId,address payer,address provider,address token,uint256 amount,uint256 nonce,uint64 deadline,bytes32 requestHash,bytes32 policyId)"
     );
+
+    bytes32 public constant CONFIRM_SERVICE_TYPEHASH = keccak256(
+        "ConfirmService(bytes32 settlementId,address payer,address provider,address token,uint256 amount,bytes32 receiptId,bytes32 requestHash,bytes32 policyId,uint8 rating,uint64 deadline,uint256 nonce)"
+    );
     
     bytes8 public constant MAGIC_PREFIX = "TRUST_V1";
     
@@ -1692,6 +1985,7 @@ contract EntryPoint is EIP712 {
     address public immutable registry;
     
     mapping(address => uint256) public nonces;
+    mapping(address => uint256) public confirmNonces;
     
     event ServiceTxExecuted(
         bytes32 indexed requestHash,
@@ -1734,7 +2028,7 @@ contract EntryPoint is EIP712 {
             ISettlement(settlement).deposit(tx_.payer, tx_.token, tx_.amount);
         } else if (tx_.kind == uint8(TrustChainTypes.TxKind.SETTLE)) {
             ISettlement(settlement).settle(
-                tx_.payer, tx_.provider, tx_.token, tx_.amount, tx_.requestHash
+                tx_.payer, tx_.provider, tx_.token, tx_.amount, tx_.requestHash, tx_.policyId
             );
         }
         // ... other kinds
@@ -1742,6 +2036,30 @@ contract EntryPoint is EIP712 {
         emit ServiceTxExecuted(
             tx_.requestHash, tx_.kind, tx_.payer, tx_.provider, tx_.amount
         );
+    }
+
+    function settleWithConfirm(
+        TrustChainTypes.UsageReceipt calldata receipt,
+        TrustChainTypes.ConfirmService calldata confirm,
+        bytes calldata confirmSig
+    ) external {
+        require(block.timestamp <= confirm.deadline, "Expired");
+        require(confirm.nonce == confirmNonces[confirm.payer], "Invalid nonce");
+        confirmNonces[confirm.payer]++;
+        require(confirm.receiptId == receipt.receiptId, "Receipt mismatch");
+        require(confirm.amount == receipt.amount, "Amount mismatch");
+
+        bytes32 structHash = keccak256(abi.encode(
+            CONFIRM_SERVICE_TYPEHASH,
+            confirm.settlementId, confirm.payer, confirm.provider, confirm.token,
+            confirm.amount, confirm.receiptId, confirm.requestHash, confirm.policyId,
+            confirm.rating, confirm.deadline, confirm.nonce
+        ));
+        bytes32 digest = _hashTypedDataV4(structHash);
+        address signer = ECDSA.recover(digest, confirmSig);
+        require(signer == confirm.payer, "Invalid signature");
+
+        ISettlement(settlement).settleWithConfirm(receipt, confirm);
     }
     
     function domainSeparator() external view returns (bytes32) {
@@ -1770,7 +2088,7 @@ contract Settlement is ReentrancyGuard {
     // payer => token => EscrowAccount
     mapping(address => mapping(address => TrustChainTypes.EscrowAccount)) public escrows;
     
-    // requestHash => PendingSettlement
+    // settlementId => PendingSettlement
     mapping(bytes32 => PendingSettlement) public pendingSettlements;
     
     struct PendingSettlement {
@@ -1778,6 +2096,7 @@ contract Settlement is ReentrancyGuard {
         address provider;
         address token;
         uint256 amount;
+        bytes32 requestHash;
         uint64 settleTime;
         bool finalized;
     }
@@ -1795,24 +2114,29 @@ contract Settlement is ReentrancyGuard {
         address token,
         uint256 amount,
         bytes32 requestHash
-    ) external nonReentrant {
+    ) external nonReentrant returns (bytes32 settlementId) {
         require(escrows[payer][token].balance >= amount, "Insufficient");
         
         escrows[payer][token].balance -= amount;
         escrows[payer][token].locked += amount;
         
-        pendingSettlements[requestHash] = PendingSettlement({
+        settlementId = keccak256(abi.encode(
+            payer, provider, token, amount, requestHash, block.number
+        ));
+        require(pendingSettlements[settlementId].payer == address(0), "Settlement exists");
+        pendingSettlements[settlementId] = PendingSettlement({
             payer: payer,
             provider: provider,
             token: token,
             amount: amount,
+            requestHash: requestHash,
             settleTime: uint64(block.timestamp),
             finalized: false
         });
     }
     
-    function finalize(bytes32 requestHash) external nonReentrant {
-        PendingSettlement storage ps = pendingSettlements[requestHash];
+    function finalize(bytes32 settlementId) external nonReentrant {
+        PendingSettlement storage ps = pendingSettlements[settlementId];
         require(!ps.finalized, "Already finalized");
         
         // Check challenge window passed
@@ -1828,8 +2152,8 @@ contract Settlement is ReentrancyGuard {
         ps.finalized = true;
     }
     
-    function advanceWithdraw(bytes32 requestHash) external nonReentrant {
-        PendingSettlement storage ps = pendingSettlements[requestHash];
+    function advanceWithdraw(bytes32 settlementId) external nonReentrant {
+        PendingSettlement storage ps = pendingSettlements[settlementId];
         require(msg.sender == ps.provider, "Only provider");
         
         // Check stake >= 2x amount
@@ -1845,7 +2169,359 @@ contract Settlement is ReentrancyGuard {
 }
 ```
 
-### B.4 部署脚本
+### B.4 完整接口定义
+
+#### ISettlement 接口
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+interface ISettlement {
+
+    /// @notice 托管账户状态
+    struct EscrowAccount {
+        uint256 balance;      // 可用余额
+        uint256 locked;       // 为待结算锁定的金额
+        uint256 nonce;        // 账户 nonce
+    }
+
+    /// @notice 待结算状态
+    struct PendingSettlement {
+        address payer;
+        address provider;
+        address token;
+        uint256 amount;
+        bytes32 requestHash;
+        uint64 settleTime;
+        uint64 challengeDeadline;
+        bytes32 policyId;
+        bool finalized;
+        bool disputed;
+    }
+
+    // ============ 存款与提取 ============
+
+    /// @notice 存入代币到托管账户
+    function deposit(address payer, address token, uint256 amount) external;
+
+    /// @notice 提取可用余额
+    function withdraw(address token, uint256 amount) external;
+
+    /// @notice 获取托管余额
+    function getBalance(address payer, address token) external view returns (uint256 available, uint256 locked);
+
+    // ============ 结算 ============
+
+    /// @notice 发起结算（锁定资金，开始挑战期）
+    function settle(
+        address payer,
+        address provider,
+        address token,
+        uint256 amount,
+        bytes32 requestHash,
+        bytes32 policyId
+    ) external returns (bytes32 settlementId);
+
+    /// @notice 快速路径结算（确认签名 + 收据）
+    function settleWithConfirm(
+        TrustChainTypes.UsageReceipt calldata receipt,
+        TrustChainTypes.ConfirmService calldata confirm
+    ) external returns (bytes32 settlementId);
+
+    /// @notice 挑战期结束后完成结算
+    function finalize(bytes32 settlementId) external;
+
+    /// @notice 批量完成多个结算
+    function batchFinalize(bytes32[] calldata settlementIds) external;
+
+    /// @notice 获取待结算详情
+    function getPendingSettlement(bytes32 settlementId) external view returns (PendingSettlement memory);
+
+    // ============ 乐观结算 ============
+
+    /// @notice Provider 提前提取（需要质押）
+    function advanceWithdraw(bytes32 settlementId) external;
+
+    /// @notice 挑战成功时回收已预支资金
+    function clawback(bytes32 settlementId, uint256 amount) external;
+
+    // ============ 争议集成 ============
+
+    /// @notice 标记结算为争议中（由 Arbitration 调用）
+    function markDisputed(bytes32 settlementId) external;
+
+    /// @notice 执行仲裁裁决
+    function executeDecision(
+        bytes32 settlementId,
+        uint16 payerShareBps,
+        uint16 providerShareBps
+    ) external;
+
+    // ============ 管理 ============
+
+    /// @notice 设置协议费用
+    function setProtocolFee(uint16 feeBps) external;
+
+    /// @notice 设置 EntryPoint 地址
+    function setEntryPoint(address entryPoint) external;
+
+    /// @notice 紧急暂停
+    function pause() external;
+
+    /// @notice 取消暂停
+    function unpause() external;
+}
+```
+
+#### IStakePool 接口
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+interface IStakePool {
+
+    /// @notice Provider 的质押状态
+    struct StakeInfo {
+        uint256 total;        // 总质押金额
+        uint256 locked;       // 为待结算锁定的金额
+        uint256 slashed;      // 累计被罚没金额
+        uint64 lastStakeTime; // 最后质押修改时间
+        uint64 unlockTime;    // 冷却解锁时间
+    }
+
+    // ============ 质押 ============
+
+    /// @notice 质押代币
+    function stake(address token, uint256 amount) external;
+
+    /// @notice 请求解除质押（开始冷却期）
+    function requestUnstake(address token, uint256 amount) external;
+
+    /// @notice 冷却期结束后完成解除质押
+    function unstake(address token, uint256 amount) external;
+
+    /// @notice 获取质押信息
+    function getStake(address provider, address token) external view returns (uint256 available, uint256 locked);
+
+    /// @notice 获取完整质押信息
+    function getStakeInfo(address provider, address token) external view returns (StakeInfo memory);
+
+    // ============ 锁定 ============
+
+    /// @notice 为乐观结算锁定质押
+    function lockStake(address provider, address token, uint256 amount) external;
+
+    /// @notice 结算完成后解锁质押
+    function unlockStake(address provider, address token, uint256 amount) external;
+
+    /// @notice 检查 Provider 是否有足够质押
+    function hasSufficientStake(
+        address provider,
+        address token,
+        uint256 requiredAmount,
+        uint256 multiplier
+    ) external view returns (bool);
+
+    // ============ 罚没 ============
+
+    /// @notice 罚没 Provider 质押（由 Arbitration 调用）
+    function slash(
+        address provider,
+        address token,
+        uint256 amount,
+        bytes32 reason
+    ) external returns (uint256 actualSlashed);
+
+    /// @notice 分配罚没资金
+    function distributeSlash(
+        uint256 amount,
+        address payer,
+        address arbitrator,
+        uint16 payerBps,
+        uint16 arbBps,
+        uint16 treasuryBps,
+        uint16 burnBps
+    ) external;
+
+    // ============ 参数 ============
+
+    /// @notice 获取最小质押要求
+    function minStake(address token) external view returns (uint256);
+
+    /// @notice 获取解除质押冷却期
+    function unstakeCooldown() external view returns (uint64);
+
+    // ============ 管理 ============
+
+    /// @notice 设置最小质押
+    function setMinStake(address token, uint256 amount) external;
+
+    /// @notice 设置解除质押冷却期
+    function setUnstakeCooldown(uint64 cooldown) external;
+
+    /// @notice 添加授权的罚没者（如 Arbitration 合约）
+    function addSlasher(address slasher) external;
+}
+```
+
+#### IRegistry 接口
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+interface IRegistry {
+
+    /// @notice 模块注册信息
+    struct ModuleInfo {
+        bytes32 moduleId;
+        string name;
+        string version;
+        address implementation;
+        bytes32 specHash;
+        uint8 riskTier;
+        string auditReportUri;
+        bool active;
+        uint64 registeredAt;
+    }
+
+    /// @notice 注册新模块
+    function registerModule(
+        bytes32 moduleId,
+        string calldata name,
+        string calldata version,
+        address implementation,
+        bytes32 specHash,
+        uint8 riskTier,
+        string calldata auditReportUri
+    ) external;
+
+    /// @notice 更新模块（创建新版本）
+    function updateModule(
+        bytes32 moduleId,
+        string calldata newVersion,
+        address newImplementation,
+        bytes32 newSpecHash
+    ) external;
+
+    /// @notice 停用模块
+    function deactivateModule(bytes32 moduleId) external;
+
+    /// @notice 获取模块信息
+    function getModule(bytes32 moduleId) external view returns (ModuleInfo memory);
+
+    /// @notice 检查模块是否激活
+    function isModuleActive(bytes32 moduleId) external view returns (bool);
+
+    // ============ 策略注册 ============
+
+    /// @notice 注册仲裁策略
+    function registerPolicy(
+        bytes32 policyId,
+        TrustChainTypes.ArbitrationPolicy calldata policy
+    ) external;
+
+    /// @notice 获取策略
+    function getPolicy(bytes32 policyId) external view returns (TrustChainTypes.ArbitrationPolicy memory);
+
+    /// @notice 检查策略是否激活
+    function isPolicyActive(bytes32 policyId) external view returns (bool);
+
+    // ============ 仲裁者注册 ============
+
+    /// @notice 为某个模式注册仲裁者
+    function registerArbitrator(
+        uint8 arbMode,
+        address arbitrator
+    ) external;
+
+    /// @notice 获取某个模式的仲裁者
+    function getArbitrator(uint8 arbMode) external view returns (address);
+
+    // ============ 访问控制 ============
+
+    /// @notice 检查地址是否为授权的模块管理员
+    function isModuleAdmin(bytes32 moduleId, address account) external view returns (bool);
+
+    /// @notice 授予模块管理员角色
+    function grantModuleAdmin(bytes32 moduleId, address account) external;
+}
+```
+
+#### IArbitration 接口
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+interface IArbitration {
+
+    /// @notice 争议信息
+    struct DisputeInfo {
+        bytes32 disputeId;
+        bytes32 settlementId;
+        bytes32 receiptId;
+        TrustChainTypes.DisputeState state;
+        address challenger;
+        address challenged;
+        uint256 payerBond;
+        uint256 providerBond;
+        uint64 openedAt;
+        uint64 bondDeadline;
+        uint64 evidenceDeadline;
+        uint64 decisionDeadline;
+        bytes32 policyId;
+        bytes32[] evidenceHashes;
+    }
+
+    // ============ 争议生命周期 ============
+
+    /// @notice 发起争议
+    function openDispute(
+        bytes32 settlementId,
+        bytes32 receiptId,
+        bytes32 policyId,
+        bytes calldata evidence
+    ) external payable returns (bytes32 disputeId);
+
+    /// @notice 提交保证金
+    function submitBond(bytes32 disputeId) external payable;
+
+    /// @notice 提交证据
+    function submitEvidence(
+        bytes32 disputeId,
+        bytes32 evidenceHash,
+        string calldata evidenceUri
+    ) external;
+
+    /// @notice 提交裁决（由仲裁者调用）
+    function submitDecision(
+        bytes32 disputeId,
+        IArbitrator.Outcome outcome,
+        uint16 payerShareBps,
+        uint16 providerShareBps,
+        bytes32 reasonHash
+    ) external;
+
+    /// @notice 完成争议（执行裁决）
+    function finalizeDispute(bytes32 disputeId) external;
+
+    /// @notice 强制完成（超时后）
+    function forceFinalize(bytes32 disputeId) external;
+
+    // ============ 查询 ============
+
+    /// @notice 获取争议信息
+    function getDispute(bytes32 disputeId) external view returns (DisputeInfo memory);
+
+    /// @notice 检查争议是否可强制完成
+    function canForceFinalize(bytes32 disputeId) external view returns (bool);
+}
+```
+
+### B.5 部署脚本
 
 ```solidity
 // SPDX-License-Identifier: MIT
@@ -1888,6 +2564,741 @@ contract DeployTrustChain is Script {
         console.log("Arbitration:", address(arbitration));
     }
 }
+```
+
+### B.6 ProviderRegistry 合约
+
+ProviderRegistry 管理 Provider 的注册、能力声明和访问控制。
+
+#### 架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      ProviderRegistry                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐          │
+│  │  Provider   │    │  Service    │    │  Capability │          │
+│  │  Profiles   │    │   Types     │    │  Proofs     │          │
+│  └──────┬──────┘    └──────┬──────┘    └──────┬──────┘          │
+│         │                  │                  │                  │
+│         └──────────────────┼──────────────────┘                  │
+│                            │                                     │
+│                     ┌──────▼──────┐                              │
+│                     │   Access    │                              │
+│                     │   Control   │                              │
+│                     └──────┬──────┘                              │
+│                            │                                     │
+│         ┌──────────────────┼──────────────────┐                  │
+│         ▼                  ▼                  ▼                  │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐          │
+│  │  Whitelist  │    │  Blacklist  │    │  Rate Limit │          │
+│  └─────────────┘    └─────────────┘    └─────────────┘          │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 接口定义
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+interface IProviderRegistry {
+
+    /// @notice Provider 状态
+    enum ProviderStatus {
+        UNREGISTERED,
+        PENDING,          // 等待验证
+        ACTIVE,
+        SUSPENDED,
+        BLACKLISTED
+    }
+
+    /// @notice Provider 档案
+    struct ProviderProfile {
+        address providerAddress;
+        bytes32 providerId;
+        string name;
+        string metadataUri;         // IPFS/Arweave URI，用于扩展元数据
+        ProviderStatus status;
+        uint64 registeredAt;
+        uint64 lastActiveAt;
+        uint256 totalSettled;       // 累计结算金额
+        uint256 disputeCount;
+        uint256 disputeLossCount;
+        bytes32[] serviceTypes;     // 支持的服务类型
+        bytes32[] moduleIds;        // 注册的模块
+    }
+
+    /// @notice 服务类型定义
+    struct ServiceType {
+        bytes32 typeId;
+        string name;
+        string description;
+        bytes32 specHash;           // 服务规范哈希
+        uint8 requiredArbMode;      // 所需的仲裁模式
+        uint256 minStakeRequired;   // 该服务类型所需的最小质押
+        bool active;
+    }
+
+    /// @notice 能力证明（如 TEE 证明、ZK 凭证）
+    struct CapabilityProof {
+        bytes32 proofId;
+        bytes32 capabilityType;     // "TEE_SGX", "ZK_PROVER", "ORACLE_NODE" 等
+        bytes proofData;            // 编码的证明数据
+        uint64 issuedAt;
+        uint64 expiresAt;
+        address issuer;             // 证明签发者（如 Intel 对于 SGX）
+        bool verified;
+    }
+
+    // ============ 注册 ============
+
+    /// @notice 注册为 Provider
+    function registerProvider(
+        string calldata name,
+        string calldata metadataUri,
+        bytes32[] calldata serviceTypes
+    ) external payable returns (bytes32 providerId);
+
+    /// @notice 更新 Provider 档案
+    function updateProfile(
+        string calldata name,
+        string calldata metadataUri
+    ) external;
+
+    /// @notice 添加支持的服务类型
+    function addServiceType(bytes32 serviceTypeId) external;
+
+    /// @notice 移除支持的服务类型
+    function removeServiceType(bytes32 serviceTypeId) external;
+
+    /// @notice 提交能力证明
+    function submitCapabilityProof(
+        bytes32 capabilityType,
+        bytes calldata proofData,
+        uint64 expiresAt
+    ) external returns (bytes32 proofId);
+
+    // ============ 查询 ============
+
+    /// @notice 获取 Provider 档案
+    function getProvider(address provider) external view returns (ProviderProfile memory);
+
+    /// @notice 通过 ID 获取 Provider
+    function getProviderById(bytes32 providerId) external view returns (ProviderProfile memory);
+
+    /// @notice 检查 Provider 是否激活
+    function isProviderActive(address provider) external view returns (bool);
+
+    /// @notice 检查 Provider 是否支持服务类型
+    function supportsServiceType(address provider, bytes32 serviceTypeId) external view returns (bool);
+
+    /// @notice 获取 Provider 的能力证明
+    function getCapabilityProofs(address provider) external view returns (CapabilityProof[] memory);
+
+    /// @notice 验证能力证明是否有效
+    function hasValidCapability(address provider, bytes32 capabilityType) external view returns (bool);
+
+    // ============ 服务类型管理 ============
+
+    /// @notice 注册新的服务类型
+    function registerServiceType(
+        bytes32 typeId,
+        string calldata name,
+        string calldata description,
+        bytes32 specHash,
+        uint8 requiredArbMode,
+        uint256 minStakeRequired
+    ) external;
+
+    /// @notice 获取服务类型信息
+    function getServiceType(bytes32 typeId) external view returns (ServiceType memory);
+
+    // ============ 访问控制 ============
+
+    /// @notice 暂停 Provider
+    function suspendProvider(address provider, string calldata reason) external;
+
+    /// @notice 重新激活被暂停的 Provider
+    function reactivateProvider(address provider) external;
+
+    /// @notice 将 Provider 加入黑名单
+    function blacklistProvider(address provider, string calldata reason) external;
+
+    /// @notice 检查 Provider 是否在黑名单中
+    function isBlacklisted(address provider) external view returns (bool);
+
+    // ============ 速率限制 ============
+
+    /// @notice 获取 Provider 的结算限额
+    function getSettlementLimit(address provider) external view returns (uint256 daily, uint256 perTx);
+
+    /// @notice 检查 Provider 是否可以结算金额
+    function canSettle(address provider, uint256 amount) external view returns (bool);
+
+    /// @notice 记录结算（由 Settlement 合约调用）
+    function recordSettlement(address provider, uint256 amount) external;
+
+    // ============ 声誉集成 ============
+
+    /// @notice 获取 Provider 声誉分数（0-10000）
+    function getReputationScore(address provider) external view returns (uint16);
+
+    /// @notice 记录争议结果（由 Arbitration 调用）
+    function recordDisputeOutcome(address provider, bool won) external;
+}
+```
+
+#### Provider 注册流程
+
+```
+┌─────────┐                    ┌──────────────────┐                    ┌───────────┐
+│ Provider│                    │ ProviderRegistry │                    │ StakePool │
+└────┬────┘                    └────────┬─────────┘                    └─────┬─────┘
+     │                                  │                                    │
+     │  1. registerProvider()           │                                    │
+     │  + registration fee              │                                    │
+     │─────────────────────────────────►│                                    │
+     │                                  │                                    │
+     │  2. Validate inputs              │                                    │
+     │  Create profile (PENDING)        │                                    │
+     │                                  │                                    │
+     │  3. stake()                      │                                    │
+     │───────────────────────────────────────────────────────────────────────►
+     │                                  │                                    │
+     │                                  │  4. Check stake meets minimum      │
+     │                                  │◄────────────────────────────────────
+     │                                  │                                    │
+     │  5. submitCapabilityProof()      │                                    │
+     │  (optional, for TEE/ZK)          │                                    │
+     │─────────────────────────────────►│                                    │
+     │                                  │                                    │
+     │  6. Verify proof                 │                                    │
+     │  Activate provider               │                                    │
+     │                                  │                                    │
+     │  7. ProviderActivated event      │                                    │
+     │◄─────────────────────────────────│                                    │
+     │                                  │                                    │
+     │  Provider can now accept         │                                    │
+     │  ServiceRequests                 │                                    │
+```
+
+#### 基于层级的限额
+
+Provider 根据质押和声誉被分配到不同层级，决定其运营限额：
+
+| 层级 | 最小质押 | 最大单笔 | 每日限额 | 所需声誉 |
+|------|----------|----------|----------|----------|
+| Starter | 100 USDC | 100 USDC | 1,000 USDC | N/A（新用户） |
+| Basic | 1,000 USDC | 500 USDC | 10,000 USDC | >= 5000 |
+| Standard | 5,000 USDC | 2,000 USDC | 50,000 USDC | >= 7000 |
+| Premium | 25,000 USDC | 10,000 USDC | 250,000 USDC | >= 8500 |
+| Enterprise | 100,000 USDC | 无限制 | 无限制 | >= 9500 |
+
+```solidity
+/// @notice 层级配置
+struct TierConfig {
+    uint256 minStake;
+    uint256 maxPerTx;
+    uint256 dailyLimit;
+    uint16 minReputation;
+}
+
+/// @notice 获取 Provider 的当前层级
+function getProviderTier(address provider) external view returns (uint8 tier, TierConfig memory config);
+```
+
+### B.7 Watcher 网络规范
+
+Watcher 监控结算并可以挑战欺诈性声明。健康的 Watcher 网络对协议安全至关重要。
+
+#### 架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       Watcher Network                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐     │
+│  │ Watcher 1 │  │ Watcher 2 │  │ Watcher 3 │  │ Watcher N │     │
+│  │ (Full)    │  │ (Light)   │  │ (Full)    │  │ (Light)   │     │
+│  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘     │
+│        │              │              │              │            │
+│        └──────────────┼──────────────┼──────────────┘            │
+│                       │              │                           │
+│                ┌──────▼──────┐┌──────▼──────┐                    │
+│                │  Event      ││  Challenge  │                    │
+│                │  Indexer    ││  Coordinator│                    │
+│                └──────┬──────┘└──────┬──────┘                    │
+│                       │              │                           │
+│                       └──────┬───────┘                           │
+│                              │                                   │
+│                       ┌──────▼──────┐                            │
+│                       │  Watcher    │                            │
+│                       │  Registry   │                            │
+│                       └─────────────┘                            │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### Watcher 类型
+
+| 类型 | 职责 | 质押要求 | 奖励份额 |
+|------|------|----------|----------|
+| **Full Watcher** | 索引所有结算，验证收据，发起挑战 | 10,000 USDC | 挑战者奖励的 70% |
+| **Light Watcher** | 监控特定 Provider 或模块，向 Full Watcher 报告 | 1,000 USDC | 挑战者奖励的 20% |
+| **Delegated Watcher** | 接收代币持有者的委托，分享奖励 | 可变 | 基于委托 |
+
+#### 接口定义
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+interface IWatcherRegistry {
+
+    /// @notice Watcher 状态
+    enum WatcherStatus {
+        INACTIVE,
+        ACTIVE,
+        SUSPENDED,
+        EXITING     // 解绑期
+    }
+
+    /// @notice Watcher 类型
+    enum WatcherType {
+        FULL,
+        LIGHT,
+        DELEGATED
+    }
+
+    /// @notice Watcher 档案
+    struct WatcherProfile {
+        address watcherAddress;
+        bytes32 watcherId;
+        WatcherType watcherType;
+        WatcherStatus status;
+        uint256 stake;
+        uint256 delegatedStake;
+        uint64 registeredAt;
+        uint64 lastActiveAt;
+        uint32 successfulChallenges;
+        uint32 failedChallenges;
+        uint256 totalRewards;
+        bytes32[] watchedModules;    // 该 Watcher 监控的模块
+        address[] watchedProviders;  // 要监控的特定 Provider
+    }
+
+    /// @notice 挑战记录
+    struct ChallengeRecord {
+        bytes32 challengeId;
+        bytes32 settlementId;
+        address watcher;
+        uint64 timestamp;
+        bool successful;
+        uint256 reward;
+    }
+
+    // ============ 注册 ============
+
+    /// @notice 注册为 Watcher
+    function registerWatcher(
+        WatcherType watcherType,
+        bytes32[] calldata watchedModules
+    ) external payable returns (bytes32 watcherId);
+
+    /// @notice 增加质押
+    function addStake(uint256 amount) external;
+
+    /// @notice 请求解除质押（开始解绑期）
+    function requestUnstake(uint256 amount) external;
+
+    /// @notice 解绑期结束后完成解除质押
+    function unstake() external;
+
+    /// @notice 更新监控的模块
+    function updateWatchedModules(bytes32[] calldata modules) external;
+
+    /// @notice 添加要监控的特定 Provider
+    function addWatchedProvider(address provider) external;
+
+    // ============ 委托 ============
+
+    /// @notice 将质押委托给 Watcher
+    function delegate(address watcher, uint256 amount) external;
+
+    /// @notice 取消委托
+    function undelegate(address watcher, uint256 amount) external;
+
+    /// @notice 获取委托给 Watcher 的总质押
+    function getDelegatedStake(address watcher) external view returns (uint256);
+
+    // ============ 挑战 ============
+
+    /// @notice 报告可疑结算
+    function reportSuspicious(
+        bytes32 settlementId,
+        bytes calldata evidence
+    ) external returns (bytes32 reportId);
+
+    /// @notice 记录挑战结果（由 Arbitration 调用）
+    function recordChallengeOutcome(
+        bytes32 challengeId,
+        address watcher,
+        bool successful,
+        uint256 reward
+    ) external;
+
+    // ============ 查询 ============
+
+    /// @notice 获取 Watcher 档案
+    function getWatcher(address watcher) external view returns (WatcherProfile memory);
+
+    /// @notice 检查 Watcher 是否激活
+    function isWatcherActive(address watcher) external view returns (bool);
+
+    /// @notice 获取模块的活跃 Watcher
+    function getWatchersForModule(bytes32 moduleId) external view returns (address[] memory);
+
+    /// @notice 获取挑战历史
+    function getChallengeHistory(address watcher) external view returns (ChallengeRecord[] memory);
+
+    // ============ 覆盖率指标 ============
+
+    /// @notice 获取结算金额的 Watcher 覆盖率
+    function getWatcherCoverage(uint256 amount) external view returns (
+        uint8 watcherCount,
+        uint256 totalStake,
+        bool sufficientCoverage
+    );
+
+    /// @notice 结算金额所需的最小 Watcher 数量
+    function requiredWatchers(uint256 amount) external view returns (uint8);
+
+    // ============ 奖励 ============
+
+    /// @notice 领取累计奖励
+    function claimRewards() external returns (uint256);
+
+    /// @notice 获取待领取奖励
+    function pendingRewards(address watcher) external view returns (uint256);
+}
+```
+
+#### Watcher 激励模型
+
+```
+挑战奖励分配：
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    罚没金额 (S)                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐        │
+│  │ Payer (50%)   │  │Challenger(20%)│  │ Protocol(30%) │        │
+│  └───────────────┘  └───────┬───────┘  └───────────────┘        │
+│                             │                                    │
+│                             ▼                                    │
+│                  ┌─────────────────────┐                         │
+│                  │  Challenger Reward  │                         │
+│                  │    Distribution     │                         │
+│                  └─────────┬───────────┘                         │
+│                            │                                     │
+│           ┌────────────────┼────────────────┐                    │
+│           ▼                ▼                ▼                    │
+│    ┌────────────┐   ┌────────────┐   ┌────────────┐             │
+│    │ Initiator  │   │ Full       │   │ Light      │             │
+│    │ (40%)      │   │ Watchers   │   │ Watchers   │             │
+│    │            │   │ (40%)      │   │ (20%)      │             │
+│    └────────────┘   └────────────┘   └────────────┘             │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 覆盖率要求
+
+高价值结算需要最小 Watcher 覆盖率：
+
+| 结算金额 | 最小 Watcher 数 | 最小总质押 |
+|----------|----------------|------------|
+| < 1,000 USDC | 1 | 5,000 USDC |
+| 1,000 - 10,000 USDC | 2 | 20,000 USDC |
+| 10,000 - 100,000 USDC | 3 | 100,000 USDC |
+| > 100,000 USDC | 5 | 500,000 USDC |
+
+如果覆盖率不足，结算进入延长挑战期（2 倍正常时间）。
+
+### B.8 事件日志定义
+
+用于链下索引和监控的完整事件定义：
+
+```solidity
+// ============ EntryPoint 事件 ============
+
+event ServiceTxExecuted(
+    bytes32 indexed requestHash,
+    uint8 indexed kind,
+    address indexed payer,
+    address provider,
+    uint256 amount,
+    bytes32 moduleId,
+    bytes32 policyId
+);
+
+event NonceUsed(address indexed payer, uint256 nonce);
+
+// ============ Settlement 事件 ============
+
+event Deposited(
+    address indexed payer,
+    address indexed token,
+    uint256 amount,
+    uint256 newBalance
+);
+
+event Withdrawn(
+    address indexed payer,
+    address indexed token,
+    uint256 amount,
+    uint256 newBalance
+);
+
+event SettlementInitiated(
+    bytes32 indexed settlementId,
+    bytes32 indexed requestHash,
+    address indexed payer,
+    address provider,
+    address token,
+    uint256 amount,
+    uint64 challengeDeadline
+);
+
+event SettlementFinalized(
+    bytes32 indexed settlementId,
+    address indexed provider,
+    uint256 providerAmount,
+    uint256 protocolFee
+);
+
+event AdvanceWithdrawn(
+    bytes32 indexed settlementId,
+    address indexed provider,
+    uint256 advanceAmount,
+    uint256 lockedStake
+);
+
+event Clawback(
+    bytes32 indexed settlementId,
+    address indexed provider,
+    uint256 clawbackAmount
+);
+
+// ============ Arbitration 事件 ============
+
+event DisputeOpened(
+    bytes32 indexed disputeId,
+    bytes32 indexed settlementId,
+    address indexed challenger,
+    address challenged,
+    bytes32 policyId
+);
+
+event BondSubmitted(
+    bytes32 indexed disputeId,
+    address indexed party,
+    uint256 amount
+);
+
+event EvidenceSubmitted(
+    bytes32 indexed disputeId,
+    address indexed submitter,
+    bytes32 evidenceHash,
+    string evidenceUri
+);
+
+event DecisionSubmitted(
+    bytes32 indexed disputeId,
+    IArbitrator.Outcome outcome,
+    uint16 payerShareBps,
+    uint16 providerShareBps,
+    bytes32 reasonHash
+);
+
+event DisputeFinalized(
+    bytes32 indexed disputeId,
+    IArbitrator.Outcome outcome,
+    uint256 payerAmount,
+    uint256 providerAmount,
+    uint256 slashedAmount
+);
+
+event ForceFinalized(
+    bytes32 indexed disputeId,
+    IArbitrator.Outcome outcome,
+    address indexed caller
+);
+
+// ============ StakePool 事件 ============
+
+event Staked(
+    address indexed provider,
+    address indexed token,
+    uint256 amount,
+    uint256 totalStake
+);
+
+event UnstakeRequested(
+    address indexed provider,
+    address indexed token,
+    uint256 amount,
+    uint64 unlockTime
+);
+
+event Unstaked(
+    address indexed provider,
+    address indexed token,
+    uint256 amount,
+    uint256 remainingStake
+);
+
+event StakeLocked(
+    address indexed provider,
+    address indexed token,
+    uint256 amount,
+    bytes32 settlementId
+);
+
+event StakeUnlocked(
+    address indexed provider,
+    address indexed token,
+    uint256 amount,
+    bytes32 settlementId
+);
+
+event Slashed(
+    address indexed provider,
+    address indexed token,
+    uint256 amount,
+    bytes32 reason
+);
+
+event SlashDistributed(
+    uint256 totalAmount,
+    uint256 payerAmount,
+    uint256 arbAmount,
+    uint256 treasuryAmount,
+    uint256 burnAmount
+);
+
+// ============ ProviderRegistry 事件 ============
+
+event ProviderRegistered(
+    address indexed provider,
+    bytes32 indexed providerId,
+    string name
+);
+
+event ProviderActivated(
+    address indexed provider,
+    bytes32 indexed providerId
+);
+
+event ProviderSuspended(
+    address indexed provider,
+    string reason
+);
+
+event ProviderBlacklisted(
+    address indexed provider,
+    string reason
+);
+
+event ServiceTypeAdded(
+    address indexed provider,
+    bytes32 indexed serviceTypeId
+);
+
+event CapabilityProofSubmitted(
+    address indexed provider,
+    bytes32 indexed proofId,
+    bytes32 capabilityType
+);
+
+event ReputationUpdated(
+    address indexed provider,
+    uint16 oldScore,
+    uint16 newScore
+);
+
+// ============ WatcherRegistry 事件 ============
+
+event WatcherRegistered(
+    address indexed watcher,
+    bytes32 indexed watcherId,
+    IWatcherRegistry.WatcherType watcherType
+);
+
+event WatcherStakeChanged(
+    address indexed watcher,
+    uint256 oldStake,
+    uint256 newStake
+);
+
+event SuspiciousReported(
+    bytes32 indexed reportId,
+    bytes32 indexed settlementId,
+    address indexed watcher
+);
+
+event ChallengeRecorded(
+    bytes32 indexed challengeId,
+    address indexed watcher,
+    bool successful,
+    uint256 reward
+);
+
+event RewardsClaimed(
+    address indexed watcher,
+    uint256 amount
+);
+
+event DelegationChanged(
+    address indexed delegator,
+    address indexed watcher,
+    uint256 amount,
+    bool isDelegation  // true = 委托, false = 取消委托
+);
+
+// ============ Registry 事件 ============
+
+event ModuleRegistered(
+    bytes32 indexed moduleId,
+    string name,
+    string version,
+    address implementation
+);
+
+event ModuleUpdated(
+    bytes32 indexed moduleId,
+    string newVersion,
+    address newImplementation
+);
+
+event ModuleDeactivated(
+    bytes32 indexed moduleId
+);
+
+event PolicyRegistered(
+    bytes32 indexed policyId,
+    uint8 arbMode
+);
+
+event ArbitratorRegistered(
+    uint8 indexed arbMode,
+    address arbitrator
+);
 ```
 
 ---
@@ -1941,7 +3352,381 @@ struct EvidenceRecord {
 
 ---
 
-## 附录 D：术语表
+## 附录 D：Merkle 批量结算
+
+### D.1 批量结算架构
+
+对于高频、低价值的交易（如 API 调用），单个链上结算成本过高。Merkle 批量结算将多个收据聚合为单个链上承诺。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    批量结算流程                                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                   │
+│  链下 (Provider)                     链上                          │
+│  ┌─────────────────────┐                                         │
+│  │ Receipt 1           │                                         │
+│  │ Receipt 2           │                                         │
+│  │ Receipt 3           │     批量                                 │
+│  │ ...                 │ ──────────►  ┌──────────────────┐       │
+│  │ Receipt N           │              │  ReceiptBatch    │       │
+│  └─────────────────────┘              │  - batchId       │       │
+│           │                           │  - merkleRoot    │       │
+│           ▼                           │  - totalAmount   │       │
+│  ┌─────────────────────┐              │  - receiptCount  │       │
+│  │   Merkle Tree       │              └────────┬─────────┘       │
+│  │                     │                       │                 │
+│  │       Root          │                       ▼                 │
+│  │      /    \         │              挑战窗口                    │
+│  │    H01    H23       │                       │                 │
+│  │   /  \   /  \       │                       ▼                 │
+│  │  H0  H1 H2  H3      │              ┌─────────────────┐        │
+│  │  |   |  |   |       │              │ Dispute (if any)│        │
+│  │  R0  R1 R2  R3      │              │ - merkleProof   │        │
+│  └─────────────────────┘              │ - receiptData   │        │
+│                                       └─────────────────┘        │
+│                                                                   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### D.2 数据结构
+
+```solidity
+/// @notice 批量结算链上承诺
+struct ReceiptBatch {
+    bytes32 batchId;
+    bytes32 merkleRoot;        // 收据 Merkle 树根
+    address provider;
+    address token;
+    uint256 totalAmount;       // 所有收据金额总和
+    uint32 receiptCount;       // 批次中的收据数量
+    uint64 fromTime;           // 最早收据时间戳
+    uint64 toTime;             // 最晚收据时间戳
+    uint64 submittedAt;
+    bytes32 policyId;
+}
+
+/// @notice 用于 Merkle 证明验证的单个收据
+struct MerkleReceipt {
+    bytes32 receiptId;
+    bytes32 requestId;
+    address payer;
+    uint256 amount;
+    uint64 timestamp;
+    bytes32 payloadHash;
+    bytes32 responseHash;
+}
+
+/// @notice 单个收据争议的 Merkle 证明
+struct MerkleProof {
+    bytes32[] proof;           // 兄弟节点哈希
+    uint256 index;             // 树中叶节点索引
+    MerkleReceipt receipt;     // 争议的收据
+}
+```
+
+### D.3 批量结算合约
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
+
+contract BatchSettlement {
+
+    mapping(bytes32 => ReceiptBatch) public batches;
+    mapping(bytes32 => mapping(bytes32 => bool)) public disputedReceipts; // batchId => receiptId => disputed
+
+    uint32 public constant MAX_BATCH_SIZE = 10000;
+    uint64 public constant MIN_BATCH_INTERVAL = 1 hours;
+
+    event BatchSubmitted(
+        bytes32 indexed batchId,
+        address indexed provider,
+        bytes32 merkleRoot,
+        uint256 totalAmount,
+        uint32 receiptCount
+    );
+
+    event ReceiptDisputed(
+        bytes32 indexed batchId,
+        bytes32 indexed receiptId,
+        address indexed challenger
+    );
+
+    /// @notice 提交一批收据
+    function submitBatch(
+        ReceiptBatch calldata batch,
+        bytes calldata providerSignature
+    ) external returns (bytes32 batchId) {
+        require(batch.receiptCount <= MAX_BATCH_SIZE, "Batch too large");
+        require(batch.toTime - batch.fromTime >= MIN_BATCH_INTERVAL, "Interval too short");
+
+        // 验证 Provider 签名
+        bytes32 batchHash = keccak256(abi.encode(batch));
+        address signer = ECDSA.recover(batchHash, providerSignature);
+        require(signer == batch.provider, "Invalid signature");
+
+        batchId = keccak256(abi.encodePacked(
+            batch.provider,
+            batch.merkleRoot,
+            batch.fromTime,
+            batch.toTime
+        ));
+
+        batches[batchId] = batch;
+
+        // 按比例锁定付款方资金
+        _lockPayerFunds(batch);
+
+        emit BatchSubmitted(
+            batchId,
+            batch.provider,
+            batch.merkleRoot,
+            batch.totalAmount,
+            batch.receiptCount
+        );
+    }
+
+    /// @notice 争议批次中的特定收据
+    function disputeReceipt(
+        bytes32 batchId,
+        MerkleProof calldata proof
+    ) external {
+        ReceiptBatch storage batch = batches[batchId];
+        require(batch.batchId != bytes32(0), "Batch not found");
+
+        // 验证 Merkle 证明
+        bytes32 leaf = keccak256(abi.encode(proof.receipt));
+        require(
+            MerkleProof.verify(proof.proof, batch.merkleRoot, leaf),
+            "Invalid Merkle proof"
+        );
+
+        // 验证收据未被争议
+        require(
+            !disputedReceipts[batchId][proof.receipt.receiptId],
+            "Already disputed"
+        );
+
+        disputedReceipts[batchId][proof.receipt.receiptId] = true;
+
+        // 发起单个争议
+        IArbitration(arbitration).openDispute(
+            batchId,
+            proof.receipt.receiptId,
+            batch.policyId,
+            abi.encode(proof)
+        );
+
+        emit ReceiptDisputed(batchId, proof.receipt.receiptId, msg.sender);
+    }
+
+    /// @notice 挑战期结束后完成批次
+    function finalizeBatch(bytes32 batchId) external {
+        ReceiptBatch storage batch = batches[batchId];
+        require(batch.batchId != bytes32(0), "Batch not found");
+
+        // 检查挑战期已过
+        uint64 challengeDeadline = batch.submittedAt + IRegistry(registry)
+            .getPolicy(batch.policyId).challengeWindow;
+        require(block.timestamp > challengeDeadline, "Challenge window active");
+
+        // 计算争议金额
+        uint256 disputedAmount = _calculateDisputedAmount(batchId);
+        uint256 settleAmount = batch.totalAmount - disputedAmount;
+
+        // 结算无争议金额
+        ISettlement(settlement).finalizeBatch(
+            batch.provider,
+            batch.token,
+            settleAmount
+        );
+    }
+
+    /// @notice 链下生成 Merkle 树（参考实现）
+    function computeMerkleRoot(
+        MerkleReceipt[] memory receipts
+    ) external pure returns (bytes32) {
+        require(receipts.length > 0, "Empty receipts");
+
+        // 计算叶节点哈希
+        bytes32[] memory leaves = new bytes32[](receipts.length);
+        for (uint i = 0; i < receipts.length; i++) {
+            leaves[i] = keccak256(abi.encode(receipts[i]));
+        }
+
+        // 自底向上构建树
+        while (leaves.length > 1) {
+            bytes32[] memory nextLevel = new bytes32[]((leaves.length + 1) / 2);
+            for (uint i = 0; i < leaves.length; i += 2) {
+                if (i + 1 < leaves.length) {
+                    nextLevel[i / 2] = keccak256(abi.encodePacked(
+                        leaves[i] < leaves[i + 1] ? leaves[i] : leaves[i + 1],
+                        leaves[i] < leaves[i + 1] ? leaves[i + 1] : leaves[i]
+                    ));
+                } else {
+                    nextLevel[i / 2] = leaves[i];
+                }
+            }
+            leaves = nextLevel;
+        }
+
+        return leaves[0];
+    }
+}
+```
+
+### D.4 部分争议解决
+
+当批次中的单个收据被争议时：
+
+```
+批次争议解决：
+
+┌────────────────────────────────────────────────────────────────┐
+│                    1000 个收据的批次                             │
+│                    总计: 10,000 USDC                            │
+├────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌────────────────┐  │
+│  │ 无争议          │  │ 争议 #42        │  │ 争议 #789      │  │
+│  │ 998 个收据      │  │ 50 USDC         │  │ 30 USDC        │  │
+│  │ 9,920 USDC      │  │ → 仲裁          │  │ → 仲裁         │  │
+│  └────────┬────────┘  └────────┬────────┘  └───────┬────────┘  │
+│           │                    │                    │           │
+│           ▼                    ▼                    ▼           │
+│   正常结算              等待仲裁              等待仲裁          │
+│   挑战期后                                        │           │
+│                                                                 │
+└────────────────────────────────────────────────────────────────┘
+```
+
+| 场景 | 操作 |
+|------|------|
+| 无争议 | 挑战期后整个批次结算 |
+| 单个收据争议 | 争议金额保留；其余结算 |
+| 多个收据争议 | 每个争议金额单独保留 |
+| >10% 批次争议 | 延长挑战期（2 倍） |
+| Provider 败诉 | 从质押池罚没 |
+
+---
+
+## 附录 E：Gas 成本分析
+
+### E.1 各操作 Gas 估算
+
+基于 Base (L2) 的 Gas 成本。估算假设典型的合约大小和存储模式。
+
+| 操作 | Gas（估算） | 成本 @ 0.01 gwei | 备注 |
+|------|------------|------------------|------|
+| **Deposit** | 65,000 | ~$0.001 | ERC20 转账 + 存储 |
+| **Withdraw** | 45,000 | ~$0.001 | ERC20 转账 + 存储更新 |
+| **Single Settlement** | 120,000 | ~$0.002 | 完整结算流程 |
+| **Batch Submit (1000 receipts)** | 150,000 | ~$0.002 | 仅 Merkle 根 |
+| **Batch Finalize** | 80,000 | ~$0.001 | 无争议 |
+| **Open Dispute** | 180,000 | ~$0.003 | 创建争议 + 保证金 |
+| **Submit Evidence** | 95,000 | ~$0.002 | 存储证据哈希 |
+| **Submit Decision** | 140,000 | ~$0.002 | 仲裁者裁决 |
+| **Force Finalize** | 160,000 | ~$0.003 | 超时解决 |
+| **Stake** | 70,000 | ~$0.001 | Provider 质押 |
+| **Unstake Request** | 55,000 | ~$0.001 | 开始冷却期 |
+| **Slash** | 180,000 | ~$0.003 | 罚没 + 分配 |
+| **Register Provider** | 200,000 | ~$0.003 | 完整注册 |
+| **Register Watcher** | 150,000 | ~$0.002 | Watcher 注册 |
+
+### E.2 成本对比：单个 vs 批量结算
+
+```
+成本分析: 1000 次 API 调用 @ $0.01 每次 = $10 总计
+
+单个结算（每次调用）:
+  - 每次结算 Gas: 120,000
+  - 总 Gas: 120,000 × 1000 = 120,000,000
+  - 成本 @ 0.01 gwei: ~$2.00
+  - 开销: 交易价值的 20%
+
+批量结算:
+  - 批次提交: 150,000
+  - 批次完成: 80,000
+  - 总 Gas: 230,000
+  - 成本 @ 0.01 gwei: ~$0.004
+  - 开销: 交易价值的 0.04%
+
+节省: 99.8%
+```
+
+### E.3 盈亏平衡分析
+
+何时单个结算比批量结算更有意义？
+
+```
+单个结算成本: C_single = gas_single × gasPrice
+批量结算成本: C_batch = (gas_submit + gas_finalize) / N
+
+盈亏平衡: C_single = C_batch
+N = (gas_submit + gas_finalize) / gas_single
+N = 230,000 / 120,000
+N ≈ 2
+```
+
+**建议**: 对于 > 2 个收据，批量结算更具成本效益。
+
+### E.4 争议成本分析
+
+完整争议解决成本：
+
+| 参与方 | 操作 | Gas | 成本 |
+|--------|------|-----|------|
+| **Challenger** | 发起争议 | 180,000 | ~$0.003 |
+| **Challenger** | 提交保证金 | （已包含） | - |
+| **Provider** | 提交保证金 | 65,000 | ~$0.001 |
+| **Challenger** | 提交证据 | 95,000 | ~$0.002 |
+| **Provider** | 提交证据 | 95,000 | ~$0.002 |
+| **Arbitrator** | 提交裁决 | 140,000 | ~$0.002 |
+| **System** | 执行裁决 | 160,000 | ~$0.003 |
+| **总计** | | 735,000 | ~$0.013 |
+
+**注意**: 保证金金额（非 Gas）是争议的主要成本。在 L2 上 Gas 可忽略不计。
+
+### E.5 扩展预测
+
+| 每日交易量 | 结算策略 | 估算每日 Gas 成本 |
+|------------|----------|-------------------|
+| 1,000 笔 | 单个 | ~$2.00 |
+| 1,000 笔 | 批量（每小时） | ~$0.10 |
+| 10,000 笔 | 单个 | ~$20.00 |
+| 10,000 笔 | 批量（每小时） | ~$0.60 |
+| 100,000 笔 | 单个 | ~$200.00 |
+| 100,000 笔 | 批量（每小时） | ~$5.80 |
+| 1,000,000 笔 | 单个 | ~$2,000.00 |
+| 1,000,000 笔 | 批量（每小时） | ~$58.00 |
+
+### E.6 优化策略
+
+| 策略 | Gas 节省 | 权衡 |
+|------|----------|------|
+| **批量结算** | 95-99% | 延迟最终性 |
+| **Merkle 证明** | 争议时 90%+ | 复杂性 |
+| **Calldata 压缩** | 20-40% | 链下处理 |
+| **存储打包** | 10-30% | 代码复杂性 |
+| **EIP-4844 blobs** | 数据 80%+ | Base 支持待定 |
+
+### E.7 L2 vs L1 成本对比
+
+| 链 | 平均 Gas 价格 | 结算成本 | 备注 |
+|------|--------------|----------|------|
+| **Base** | 0.001-0.01 gwei | ~$0.002 | 主要部署目标 |
+| **Arbitrum** | 0.01-0.1 gwei | ~$0.01 | 替代 L2 |
+| **Optimism** | 0.001-0.01 gwei | ~$0.002 | 替代 L2 |
+| **Ethereum L1** | 20-100 gwei | ~$5-25 | 不推荐 |
+
+**建议**: 部署在 Base 上，相比 L1 成本降低 1000 倍。
+
+---
+
+## 附录 F：术语表
 
 | 术语 | 定义 |
 |------|------|
@@ -1962,12 +3747,13 @@ struct EvidenceRecord {
 
 ---
 
-**文档版本**: v0.3  
+**文档版本**: v0.4  
 **最后更新**: 2025年12月  
 **变更记录**:
 - v0.1: 初始草案
 - v0.2: 增加仲裁流程细节
 - v0.3: 整合安全模型、博弈分析、x402 迁移路径、确定性时间、Sybil 防护
+- v0.4: 扩展 Oracle 仲裁模式、添加 ProviderRegistry 和 Watcher 网络规范、完善接口定义、添加 Gas 成本分析和 Merkle 批量结算
 
 ---
 
