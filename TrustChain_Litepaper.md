@@ -1047,16 +1047,77 @@ Detailed design will be provided in the multi-chain expansion phase (Roadmap Pha
 | Module failure | Module admin | single module pause |
 | Arbitration attack | Governance vote | remove arbitrator |
 
-### 8.4 Governance Token (Optional)
+### 8.4 Protocol Token ($TRUST)
 
-If a token is introduced:
+TrustApp may introduce a native token $TRUST for incentive alignment and governance of the protocol security layer.
 
-| Function | Description |
-|----------|-------------|
-| Parameter votes | fee rates, windows, slash multiple |
-| Arbitrator elections | committee selection |
-| Treasury allocation | protocol income usage |
-| Module approvals | approve new modules |
+#### 8.4.1 Design Principles
+
+**Dual-Layer Separation**: Service settlement and protocol security use different assets.
+
+| Layer | Asset | Purpose |
+|-------|-------|---------|
+| Settlement Layer | Stablecoin (USDC) | Payer escrow, Provider collateral, service pricing |
+| Security Layer | $TRUST | Arbitrator staking, governance, value capture |
+
+This separation ensures service prices are unaffected by token volatility while providing economic incentives for protocol security.
+
+#### 8.4.2 Token Utility
+
+**1. Arbitrator Staking**
+
+Arbitrators must stake $TRUST to participate in dispute resolution:
+
+| Parameter | Description |
+|-----------|-------------|
+| Minimum Stake | Threshold to participate in arbitration |
+| Case Value Cap | Stake amount determines maximum dispute value allowed |
+| Slashing | Incorrect/malicious rulings trigger stake slashing |
+
+**2. Watcher Staking**
+
+Watchers stake $TRUST to obtain challenge rights:
+- Successful challenge: Receive share of slashed funds
+- Malicious challenge: Bond is forfeited
+
+**3. Protocol Governance**
+
+$TRUST holders may participate in the following governance decisions:
+
+| Governable | Examples |
+|------------|----------|
+| Protocol Parameters | Fee rates, challenge windows, slash ratios |
+| Arbitrator Admission | Committee member election/removal |
+| Module Approval | New ZIP module onboarding votes |
+| Treasury Spending | Protocol revenue allocation |
+
+#### 8.4.3 Value Accrual
+
+**Protocol Revenue Sources**:
+
+| Source | Description |
+|--------|-------------|
+| Protocol Fee | Fee charged on each settlement |
+| Arbitration Fee | Dispute resolution fees |
+
+**Value Capture Mechanisms**:
+
+| Mechanism | Description |
+|-----------|-------------|
+| Buyback & Burn | Portion of protocol revenue used to buy back and burn $TRUST |
+| Slashing Burns | Portion of slashed $TRUST from arbitrators/watchers is burned |
+| Staking Demand | Arbitrators and watchers must continuously hold $TRUST |
+
+#### 8.4.4 Scenarios NOT Using $TRUST
+
+The following scenarios explicitly use stablecoins to avoid token volatility affecting service reliability:
+
+| Scenario | Asset | Reason |
+|----------|-------|--------|
+| Payer Escrow | USDC | Service value must be stable |
+| Provider Collateral | USDC | Collateral value must be predictable |
+| Service Pricing & Settlement | USDC | Costs require certainty |
+| Dispute Compensation | USDC | Compensation amounts must be stable |
 
 ---
 
