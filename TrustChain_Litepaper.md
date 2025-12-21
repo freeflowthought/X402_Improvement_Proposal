@@ -1,7 +1,7 @@
-# TrustChain: Trust as a Service (TaaS) Protocol for the Decentralized Service Economy
+# TrustApp: Trust as a Service (TaaS) Protocol for the Decentralized Service Economy
 
-**Status**: Draft / Proposal  
-**Version**: v0.4  
+**Status**: Draft / Proposal
+**Version**: v0.4.1
 **Date**: December 2025  
 **Author**: 0xwilsonwu (co-authored draft)  
 **Deployment Target**: Base (EVM compatible)
@@ -12,7 +12,7 @@
 
 Blockchains excel at value transfer, but they still fail at service exchange: the chain can prove payment occurred, yet cannot guarantee service was delivered. Existing approaches often rely on reputation or centralized arbitration, which is insufficient for high-value, one-off, or cross-border service transactions.
 
-TrustChain proposes an application-layer trust protocol that does not modify base-layer consensus. It introduces standardized service transaction types, off-chain receipts, and on-chain arbitration to create verifiable service settlement. Built on Base as the settlement layer, TrustChain uses EIP-712 typed data, pluggable arbitration modules, and economic penalties to make service delivery and payment settlement enforceable in untrusted environments.
+TrustApp proposes an application-layer trust protocol that does not modify base-layer consensus. It introduces standardized service transaction types, off-chain receipts, and on-chain arbitration to create verifiable service settlement. Built on Base as the settlement layer, TrustApp uses EIP-712 typed data, pluggable arbitration modules, and economic penalties to make service delivery and payment settlement enforceable in untrusted environments.
 
 ### Core Innovations
 
@@ -25,7 +25,7 @@ TrustChain proposes an application-layer trust protocol that does not modify bas
 | **Prepaid-only model** | Services are paid from locked or pre-deposited funds, preventing non-payment |
 | **Optimistic settlement** | Providers can withdraw early with sufficient stake; challenges and slashing preserve safety |
 
-This paper describes TrustChain's architecture, transaction and receipt formats, arbitration flow, incentive model, security boundaries, and a migration path for x402-style payments.
+This paper describes TrustApp's architecture, transaction and receipt formats, arbitration flow, incentive model, security boundaries, and a migration path for x402-style payments.
 
 ---
 
@@ -159,9 +159,9 @@ The Validation Registry supports multiple verifier types but:
 - No clear effect on settlement
 - Unclear economic consequences of failure
 
-### 1.4 TrustChain Positioning
+### 1.4 TrustApp Positioning
 
-| Dimension | x402 | ERC-8004 | TrustChain |
+| Dimension | x402 | ERC-8004 | TrustApp |
 |----------|------|----------|------------|
 | **Core question** | How to pay | How to discover and rate | How to verify delivery and enforce |
 | **Trust model** | Trust facilitator | Trust reputation history | Trust economic game (stake + slashing) |
@@ -193,7 +193,7 @@ The Validation Registry supports multiple verifier types but:
 
 ### 1.6 Design Goals
 
-TrustChain aims to:
+TrustApp aims to:
 - Avoid base-layer consensus changes
 - Make service transactions identifiable
 - Enable verifiable and arbitrable settlement
@@ -218,7 +218,7 @@ TrustChain aims to:
 
 ```
 +------------------------------------------------------------------+
-|                        TrustChain Protocol                       |
+|                        TrustApp Protocol                       |
 +------------------------------------------------------------------+
 |  +------------+    +------------+    +------------+              |
 |  | EntryPoint |--> |  Registry  | <--|  StakePool |              |
@@ -263,7 +263,7 @@ module.zip/
 
 ### 2.4 Credit Execution Environment (CEE)
 
-TrustChain is not a new L1/L2. It is a Credit Execution Environment built on Base. CEE only processes transactions that follow the TaaS protocol and assigns them credit states (arbitrable, slashable, settleable).
+TrustApp is not a new L1/L2. It is a Credit Execution Environment built on Base. CEE only processes transactions that follow the TaaS protocol and assigns them credit states (arbitrable, slashable, settleable).
 
 This is a "subtraction" approach: move service verification off the consensus path while using Base as the settlement and security anchor.
 
@@ -304,7 +304,7 @@ struct ServiceTx {
 
 ### 3.1.1 Settlement Key and Hashing Rules
 
-To avoid implementation and audit ambiguity, TrustChain uses a consistent rule:
+To avoid implementation and audit ambiguity, TrustApp uses a consistent rule:
 
 - **On-chain settlement primary key**: `settlementId` (unique, non-reusable; all settle/finalize/dispute/confirm use this key)
 - **Business content hash**: `requestHash` (or `requestId`) is only for indexing/association, not a settlement primary key
@@ -378,11 +378,11 @@ struct ReceiptBatch {
 
 ### 3.5 Explicitness and Anti-Forgery
 
-To prevent spam and forgery, TrustChain adds explicit constraints:
+To prevent spam and forgery, TrustApp adds explicit constraints:
 
 | Constraint | Description |
 |-----------|-------------|
-| **EIP-712 binding** | All ServiceTx use fixed domain separator (name=TrustChainEntryPoint, version=1, chainId, verifyingContract) |
+| **EIP-712 binding** | All ServiceTx use fixed domain separator (name=TrustAppEntryPoint, version=1, chainId, verifyingContract) |
 | **Magic prefix** | ServiceRequest signatures include `TRUST_V1_` prefix |
 | **SDK enforcement** | Official SDKs output standardized structures and prefixes |
 | **Sequencer tagging (future)** | L2 sequencers can tag compliant transactions for prioritization |
@@ -393,7 +393,7 @@ To prevent spam and forgery, TrustChain adds explicit constraints:
 
 ### 4.1 Prepaid Escrow Model (Only Supported Mode)
 
-TrustChain only supports prepaid or locked funds. The payer must deposit or lock balances in Settlement. Providers can only settle within that limit.
+TrustApp only supports prepaid or locked funds. The payer must deposit or lock balances in Settlement. Providers can only settle within that limit.
 
 ```
 Payer -> Settlement: deposit(token, amount)
@@ -425,7 +425,7 @@ To solve provider liquidity, the protocol allows early withdrawal if stake is su
 3. Remaining funds and equivalent stake are locked until challengeWindow ends
 4. If a challenge succeeds, early withdrawal is clawed back and stake is slashed
 
-#### 4.4.1 Game-Theoretic Safety Analysis
+#### 4.5.1 Game-Theoretic Safety Analysis
 
 Let:
 - Service amount: `A`
@@ -623,7 +623,7 @@ Recommendation: for > $10k transactions, require at least 3 registered watchers.
 
 ### 5.5 Force Finalization
 
-If arbitrators are offline, disputes could stall. TrustChain adds layered timeouts:
+If arbitrators are offline, disputes could stall. TrustApp adds layered timeouts:
 
 | Phase | Timeout | Auto outcome |
 |-------|---------|--------------|
@@ -860,15 +860,15 @@ For all participants:
 
 ### 7.4 Double-Spend Analysis
 
-Traditional double-spend requires two confirmations of the same value transfer. TrustChain runs on Base, with funds locked in a single Settlement contract. Base provides atomic global ordering.
+Traditional double-spend requires two confirmations of the same value transfer. TrustApp runs on Base, with funds locked in a single Settlement contract. Base provides atomic global ordering.
 
 ```
-TrustChain and double-spend (conceptual):
+TrustApp and double-spend (conceptual):
 
 Traditional double-spend:
   Alice -> Bob and Alice -> Carol (same funds)
 
-TrustChain:
+TrustApp:
   Payer -> Settlement contract -> Provider
   Base consensus ensures a single global state
 ```
@@ -927,7 +927,13 @@ function createRequest(bytes32 requestId, address token, uint256 amount) externa
 
 **Case 4: Cross-chain double spend**
 
-Not applicable in v0.3 (Base only). Multi-chain expansion will require dedicated designs.
+Not applicable in v0.4.1 (Base only). Multi-chain expansion preliminary design directions:
+
+1. **Main chain anchoring**: All settlements finalize on Base as the main chain; other chains serve as execution layers
+2. **Independent validation**: Each chain runs an independent TrustApp instance, syncing Provider stake status via cross-chain messaging (e.g., LayerZero, Chainlink CCIP)
+3. **Shared stake pool**: Stake is concentrated on the main chain; other chains verify stake proofs via light clients
+
+Detailed design will be provided in the multi-chain expansion phase (Roadmap Phase 5).
 
 **Summary**
 
@@ -951,10 +957,12 @@ Not applicable in v0.3 (Base only). Multi-chain expansion will require dedicated
 | Payment default | prepaid-only model |
 | Optimistic risk | stake requirements and challenge activity |
 | Arbitrator offline | timeout + forceFinalize() |
+| MEV attacks | Relayers may front-run settle transactions; recommend private mempool (e.g., Flashbots Protect) or Base private Sequencer channel |
+| ConfirmService replay | Signature expires after deadline; nonce must be consumed on-chain; expired unused signatures are invalid |
 
 ### 7.6 Protocol Boundaries
 
-**What TrustChain can solve**
+**What TrustApp can solve**
 
 | Scenario | Verification |
 |----------|--------------|
@@ -962,7 +970,7 @@ Not applicable in v0.3 (Base only). Multi-chain expansion will require dedicated
 | Provider submits false metering data | TEE/ZK proof |
 | Objective delivery disputes | Evidence comparison |
 
-**What TrustChain cannot solve**
+**What TrustApp cannot solve**
 
 | Scenario | Reason | Suggestion |
 |----------|--------|-----------|
@@ -1060,7 +1068,7 @@ If a token is introduced:
 
 ## 10. x402 Migration Path
 
-TrustChain provides a compatibility layer for existing x402 users.
+TrustApp provides a compatibility layer for existing x402 users.
 
 ### 10.1 HTTP Header Extensions
 
@@ -1070,13 +1078,13 @@ GET /resource HTTP/1.1
 X-PAYMENT: <EIP-3009 signature>
 ```
 
-**TrustChain enhanced**:
+**TrustApp enhanced**:
 ```http
 GET /resource HTTP/1.1
 X-PAYMENT: <EIP-3009 signature>
-X-TRUSTCHAIN-REQUEST: <ServiceRequest hash>
-X-TRUSTCHAIN-POLICY: <policyId>
-X-TRUSTCHAIN-RECEIPT: <previous receipt hash>  // optional
+X-TRUSTAPP-REQUEST: <ServiceRequest hash>
+X-TRUSTAPP-POLICY: <policyId>
+X-TRUSTAPP-RECEIPT: <previous receipt hash>  // optional
 ```
 
 ### 10.2 Progressive Migration Stages
@@ -1085,7 +1093,7 @@ X-TRUSTCHAIN-RECEIPT: <previous receipt hash>  // optional
 Migration Path
 
 Stage 0 -> Stage 1 -> Stage 2 -> Stage 3
-Pure x402   x402 + Receipt   x402 + Escrow   Full TrustChain
+Pure x402   x402 + Receipt   x402 + Escrow   Full TrustApp
 
 Stage 0: instant settle, no protection, trust provider
 Stage 1: receipts, audit trail, partial verify
@@ -1096,29 +1104,29 @@ Stage 3: arbitration, full enforcement
 | Stage | Change | Protection | Use case |
 |-------|--------|------------|----------|
 | **Stage 0** | pure x402 | none | trusted provider |
-| **Stage 1** | + TrustChain receipt | traceable | auditability |
-| **Stage 2** | + TrustChain escrow | fund safety | mid-value |
-| **Stage 3** | full TrustChain | full game | high-value, untrusted |
+| **Stage 1** | + TrustApp receipt | traceable | auditability |
+| **Stage 2** | + TrustApp escrow | fund safety | mid-value |
+| **Stage 3** | full TrustApp | full game | high-value, untrusted |
 
 ### 10.3 Protocol Handshake Sequence
 
 ```
 Client -> Server: GET /resource
-Server -> Client: 402 Payment Required + X-TRUSTCHAIN-SUPPORTED
-Client -> TrustChain: deposit(amount)
-Client -> Server: GET /resource + X-PAYMENT + X-TRUSTCHAIN-REQUEST
-Server -> TrustChain: verify request
+Server -> Client: 402 Payment Required + X-TRUSTAPP-SUPPORTED
+Client -> TrustApp: deposit(amount)
+Client -> Server: GET /resource + X-PAYMENT + X-TRUSTAPP-REQUEST
+Server -> TrustApp: verify request
 Server: execute service
-Server -> Client: 200 OK + X-TRUSTCHAIN-RECEIPT
-Server -> TrustChain: settle(receipt)
+Server -> Client: 200 OK + X-TRUSTAPP-RECEIPT
+Server -> TrustApp: settle(receipt)
 ```
 
 ### 10.4 SDK Compatibility Layer
 
 ```typescript
-import { TrustChainClient } from "@trustchain/sdk";
+import { TrustAppClient } from "@trustapp/sdk";
 
-const client = new TrustChainClient({
+const client = new TrustAppClient({
   mode: "x402-compat",
   fallback: "pure-x402",
   autoUpgrade: true,
@@ -1129,7 +1137,7 @@ const response = await client.fetch("https://api.example.com/resource", {
     amount: "1000000", // 1 USDC
     token: "USDC",
   },
-  trustchain: {
+  trustapp: {
     escrow: true,
     policy: "default-api",
   },
@@ -1138,7 +1146,7 @@ const response = await client.fetch("https://api.example.com/resource", {
 
 ### 10.5 Migration Benefits
 
-| Dimension | pure x402 | TrustChain |
+| Dimension | pure x402 | TrustApp |
 |----------|-----------|------------|
 | Implementation complexity | low | medium |
 | Fund safety | none | escrow |
@@ -1163,14 +1171,14 @@ const response = await client.fetch("https://api.example.com/resource", {
 
 ## 12. Conclusion
 
-TrustChain is not a new L1. It is a trust protocol deployed on existing chains. By introducing recognizable transaction types, verifiable receipts, and pluggable arbitration, TrustChain provides an enforceable, extensible foundation for API billing and the service economy.
+TrustApp is not a new L1. It is a trust protocol deployed on existing chains. By introducing recognizable transaction types, verifiable receipts, and pluggable arbitration, TrustApp provides an enforceable, extensible foundation for API billing and the service economy.
 
-TrustChain complements x402 and ERC-8004:
+TrustApp complements x402 and ERC-8004:
 - x402 as the payment trigger layer
 - ERC-8004 as the identity and discovery layer
-- TrustChain as the settlement enforcement layer
+- TrustApp as the settlement enforcement layer
 
-As verification and arbitration modules mature, TrustChain becomes a core bridge between on-chain funds and off-chain services.
+As verification and arbitration modules mature, TrustApp becomes a core bridge between on-chain funds and off-chain services.
 
 ---
 
@@ -1507,13 +1515,15 @@ contract OracleAggregator {
 
 ## Appendix B: Core Contract Reference Implementation
 
+> **⚠️ Disclaimer**: The contract code in this appendix is for reference only, intended to illustrate protocol design intent. A professional security audit is required before actual deployment. The development team assumes no liability for any losses resulting from direct use of this code.
+
 ### B.1 Data Structures
 
 ```solidity
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
-library TrustChainTypes {
+library TrustAppTypes {
     enum TxKind {
         PAY_DIRECT,
         PAY_ESCROW,
@@ -1663,14 +1673,14 @@ contract EntryPoint is EIP712 {
         address _settlement,
         address _arbitration,
         address _registry
-    ) EIP712("TrustChainEntryPoint", "1") {
+    ) EIP712("TrustAppEntryPoint", "1") {
         settlement = _settlement;
         arbitration = _arbitration;
         registry = _registry;
     }
 
     function execute(
-        TrustChainTypes.ServiceTx calldata tx_,
+        TrustAppTypes.ServiceTx calldata tx_,
         bytes calldata signature
     ) external {
         require(block.timestamp <= tx_.deadline, "Expired");
@@ -1687,9 +1697,9 @@ contract EntryPoint is EIP712 {
         address signer = ECDSA.recover(digest, signature);
         require(signer == tx_.payer, "Invalid signature");
 
-        if (tx_.kind == uint8(TrustChainTypes.TxKind.PAY_ESCROW)) {
+        if (tx_.kind == uint8(TrustAppTypes.TxKind.PAY_ESCROW)) {
             ISettlement(settlement).deposit(tx_.payer, tx_.token, tx_.amount);
-        } else if (tx_.kind == uint8(TrustChainTypes.TxKind.SETTLE)) {
+        } else if (tx_.kind == uint8(TrustAppTypes.TxKind.SETTLE)) {
             ISettlement(settlement).settle(
                 tx_.payer, tx_.provider, tx_.token, tx_.amount, tx_.requestHash, tx_.policyId
             );
@@ -1701,8 +1711,8 @@ contract EntryPoint is EIP712 {
     }
 
     function settleWithConfirm(
-        TrustChainTypes.UsageReceipt calldata receipt,
-        TrustChainTypes.ConfirmService calldata confirm,
+        TrustAppTypes.UsageReceipt calldata receipt,
+        TrustAppTypes.ConfirmService calldata confirm,
         bytes calldata confirmSig
     ) external {
         require(block.timestamp <= confirm.deadline, "Expired");
@@ -1747,7 +1757,7 @@ contract Settlement is ReentrancyGuard {
     address public immutable arbitration;
     address public immutable stakePool;
 
-    mapping(address => mapping(address => TrustChainTypes.EscrowAccount)) public escrows;
+    mapping(address => mapping(address => TrustAppTypes.EscrowAccount)) public escrows;
     mapping(bytes32 => PendingSettlement) public pendingSettlements;
     mapping(bytes32 => bool) public settledReceipts;
 
@@ -1799,8 +1809,8 @@ contract Settlement is ReentrancyGuard {
     }
 
     function settleWithConfirm(
-        TrustChainTypes.UsageReceipt calldata receipt,
-        TrustChainTypes.ConfirmService calldata confirm
+        TrustAppTypes.UsageReceipt calldata receipt,
+        TrustAppTypes.ConfirmService calldata confirm
     ) external nonReentrant returns (bytes32 settlementId) {
         require(msg.sender == entryPoint, "Only entryPoint");
         require(!settledReceipts[receipt.receiptId], "Receipt already settled");
@@ -1900,8 +1910,8 @@ interface ISettlement {
 
     /// @notice Fast-path settlement (confirm signature + receipt)
     function settleWithConfirm(
-        TrustChainTypes.UsageReceipt calldata receipt,
-        TrustChainTypes.ConfirmService calldata confirm
+        TrustAppTypes.UsageReceipt calldata receipt,
+        TrustAppTypes.ConfirmService calldata confirm
     ) external returns (bytes32 settlementId);
 
     /// @notice Finalize settlement after challenge window
@@ -2066,7 +2076,7 @@ interface IRegistry {
     /// @notice Arbitration policy info
     struct PolicyInfo {
         bytes32 policyId;
-        TrustChainTypes.ArbitrationPolicy policy;
+        TrustAppTypes.ArbitrationPolicy policy;
         bool active;
         uint64 createdAt;
     }
@@ -2106,11 +2116,11 @@ interface IRegistry {
     /// @notice Register arbitration policy
     function registerPolicy(
         bytes32 policyId,
-        TrustChainTypes.ArbitrationPolicy calldata policy
+        TrustAppTypes.ArbitrationPolicy calldata policy
     ) external;
 
     /// @notice Get policy
-    function getPolicy(bytes32 policyId) external view returns (TrustChainTypes.ArbitrationPolicy memory);
+    function getPolicy(bytes32 policyId) external view returns (TrustAppTypes.ArbitrationPolicy memory);
 
     /// @notice Check if policy is active
     function isPolicyActive(bytes32 policyId) external view returns (bool);
@@ -2149,7 +2159,7 @@ interface IArbitration {
         bytes32 disputeId;
         bytes32 settlementId;
         bytes32 receiptId;
-        TrustChainTypes.DisputeState state;
+        TrustAppTypes.DisputeState state;
         address challenger;
         address challenged;
         uint256 payerBond;
@@ -2198,7 +2208,7 @@ interface IArbitration {
     function getDispute(bytes32 disputeId) external view returns (DisputeInfo memory);
 
     /// @notice Get dispute state
-    function getDisputeState(bytes32 disputeId) external view returns (TrustChainTypes.DisputeState);
+    function getDisputeState(bytes32 disputeId) external view returns (TrustAppTypes.DisputeState);
 
     /// @notice Check if settlement has active dispute
     function hasActiveDispute(bytes32 settlementId) external view returns (bool);
@@ -2229,7 +2239,7 @@ pragma solidity ^0.8.19;
 
 import "forge-std/Script.sol";
 
-contract DeployTrustChain is Script {
+contract DeployTrustApp is Script {
     function run() external {
         uint256 deployerPrivateKey = vm.envUint("PRIVATE_KEY");
 
@@ -3424,14 +3434,20 @@ Full dispute resolution costs:
 | **Facilitator** | x402 settlement coordinator (replaced by contracts) |
 | **arbMode** | Arbitration mode |
 | **defaultOutcome** | Default decision on timeout |
+| **settlementId** | Settlement primary key, uniquely identifies a settlement, used for all settle/finalize/dispute operations |
+| **receiptId** | Receipt unique identifier, used to prevent receipt replay |
+| **requestHash** | ServiceRequest content hash, used only for association indexing, not as settlement primary key |
+| **ConfirmService** | Fast-path confirmation message, signed by Payer to skip challenge window for instant settlement |
 
 ---
 
-**Document Version**: v0.3  
-**Last Updated**: December 2025  
+**Document Version**: v0.4.1
+**Last Updated**: December 2025
 **Change Log**:
 - v0.1: initial draft
 - v0.2: added arbitration flow details
 - v0.3: added security model, game analysis, x402 migration, finality bounds, Sybil defense
+- v0.4: expanded Oracle arbitration mode, added ProviderRegistry and Watcher network specs, complete interface definitions, Gas cost analysis and Merkle batch settlement
+- v0.4.1: fixed section numbering, expanded glossary, added MEV/cross-chain/ConfirmService security notes, added contract code disclaimer
 
-*TrustChain Protocol - Trust as a Service for the Decentralized Service Economy*
+*TrustApp Protocol - Trust as a Service for the Decentralized Service Economy*
