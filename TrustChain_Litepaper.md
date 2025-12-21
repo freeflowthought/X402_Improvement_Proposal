@@ -1171,6 +1171,60 @@ const response = await client.fetch("https://api.example.com/resource", {
 | **Phase 4** | Module marketplace + SDK | ecosystem growth |
 | **Phase 5** | x402 compatibility + cross-chain | adoption and scale |
 
+### 11.1 Future Directions
+
+The following directions will be explored as optional modules once the core protocol matures.
+
+#### 11.1.1 Cross-Chain Settlement and Double-Spend Prevention
+
+The current version supports Base only. Multi-chain expansion must address **cross-chain double-spending**: a Payer could potentially spend the same balance across multiple chains.
+
+**Candidate approaches**:
+
+| Approach | Mechanism | Trade-offs |
+|----------|-----------|------------|
+| **Main chain anchoring** | All settlements finalize on Base; other chains act as execution layers | High security, but cross-chain latency |
+| **Shared stake pool** | Stake concentrated on main chain; other chains verify via light clients | Capital efficient, bridge dependency |
+| **Independent instances + state sync** | Each chain runs independently, syncing via LayerZero/CCIP | Flexible, but consistency complexity |
+
+Key design constraints:
+- Balance locking strategy during cross-chain message delays
+- Cross-chain verifiability of stake status
+- Jurisdiction for dispute arbitration
+
+#### 11.1.2 Enterprise Credit Model
+
+The current protocol centers on **prepay escrow**, suited for trustless, one-off transactions. However, real-world commerce involves many long-term relationships (e.g., supply chain credit terms, net-30/net-60 B2B settlements) where parties rely on accumulated credit rather than per-transaction lockups.
+
+**Tiered Credit Model**:
+
+| Tier | Credit Source | Use Case |
+|------|---------------|----------|
+| Tier 0 | Full stake/escrow | New relationships, one-off deals |
+| Tier 1 | Partial stake + history | Developing partnerships |
+| Tier 2 | Low stake + off-chain recourse | Long-term partners |
+
+Core design principles:
+- **On-chain covers high-frequency small risks**: Stake and slash mechanisms secure routine transactions
+- **Off-chain covers low-frequency large risks**: Legal contracts + arbitration recourse as fallback
+- **Credit must have collateral backing**: Pure reputation is unenforceable; must combine partial stake or legal binding
+
+#### 11.1.3 Privacy-Preserving Settlement
+
+Currently all settlement data is visible on-chain. For sensitive commercial scenarios (e.g., enterprise procurement, competitive bidding), potential directions include:
+
+| Technology | Application |
+|------------|-------------|
+| **ZK Receipts** | Prove "service completed and amount correct" without revealing details |
+| **Encrypted Escrow** | Settlement amounts encrypted, decrypted only during disputes |
+| **Private Arbitration** | Evidence submission and rulings conducted in TEE or private channels |
+
+#### 11.1.4 Decentralized Arbitration Network
+
+Current arbitration relies on pre-configured arbitrators. Long-term explorations:
+- **Arbitrator marketplace**: Competitive arbitration services, matched by domain expertise and track record
+- **Stake-driven selection**: Arbitrators must stake; incorrect rulings trigger slashing
+
 ---
 
 ## 12. Conclusion
