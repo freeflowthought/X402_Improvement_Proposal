@@ -367,6 +367,16 @@ struct ConfirmService {
 
 ConfirmService is a **final authorization** for a specific settlement. The payer signs this EIP-712 message and the provider submits it via `settleWithConfirm(...)`. EntryPoint must verify deep binding (payer/provider/token/amount/receiptId/policyId), Settlement must consume the nonce/confirmHash, and the settlement must be neither disputed nor finalized. Once consumed on-chain, it is irreversible; revocation must go through dispute/arbitration.
 
+#### MEV Protection
+
+`settleWithConfirm` transactions in public mempool may be observed and exploited by MEV bots. Recommendations:
+
+| Measure | Description |
+|---------|-------------|
+| **Private submission** | Submit via Base Sequencer private RPC or Flashbots Protect to avoid public mempool |
+| **Commit-Reveal (optional)** | For high-value settlements, first submit `hash(confirm + salt)`, reveal in next block |
+| **Provider submits directly** | Provider as tx sender has aligned incentives, reducing front-run motivation |
+
 ### 3.4 Batch Settlement (Optional)
 
 ```solidity
@@ -662,6 +672,21 @@ When neither party submits valid evidence, a simple 50/50 split would incentiviz
 - Both parties' bonds are fully slashed
 
 This design penalizes "open dispute then do nothing" behavior and prevents abuse of the dispute mechanism.
+
+#### defaultOutcome Arbitrage Risk
+
+**Risk scenario**: If an ArbitrationPolicy has `defaultOutcome = PROVIDER_WINS`, a malicious Provider could DDoS arbitration nodes to force timeout and trigger the default outcome, gaining illegitimate profit.
+
+**Countermeasures**:
+
+| Measure | Description |
+|---------|-------------|
+| **No one-sided defaults** | `defaultOutcome` should only allow `INVALID` (both slashed) or `SPLIT`; prohibit `PROVIDER_WINS` / `PAYER_WINS` |
+| **Multi-arbitrator redundancy** | Assign N arbitrators (e.g., 3/5) to each dispute; majority must respond; single-point DDoS ineffective |
+| **Arbitrator liveness bond** | Arbitrators stake a bond; timeout without response triggers slashing, incentivizing uptime |
+| **Fallback escalation** | On primary arbitrator timeout, auto-escalate to backup mode (e.g., Committee → DAO vote) |
+
+**Recommended config**: `defaultOutcome = INVALID`, ensuring no timeout scenario benefits either party unilaterally.
 
 **Guarantee**: Even if the arbitration layer fails, funds do not stay locked forever.
 
@@ -1335,6 +1360,29 @@ struct TEEEvidence {
     uint64 executionTime;
 }
 ```
+
+#### On-Chain Verification Cost
+
+Direct Intel SGX Quote verification on EVM is prohibitively expensive (may exceed Gas Limit). A **relay verification layer** is required:
+
+```
+┌─────────────┐     attestation     ┌──────────────────┐
+│ TEE Enclave │ ──────────────────► │  Relay Verifier  │
+└─────────────┘                     │ (Automata/RISC0) │
+                                    └────────┬─────────┘
+                                             │ ZK proof (lightweight)
+                                    ┌────────▼─────────┐
+                                    │  EntryPoint      │
+                                    │  (verify ZK)     │
+                                    └──────────────────┘
+```
+
+**Recommended solutions**:
+- **Automata Network**: Provides SGX/TDX on-chain verification relay
+- **RISC Zero**: Compile Attestation verification logic into zkVM, generate STARK proof
+- **Self-hosted relay**: Run trusted verification nodes with multi-sig or stake-backed signing
+
+On-chain contracts only verify lightweight ZK proofs or multi-sig results, reducing Gas cost by 10-100x.
 
 ### A.4 ZK Mode
 

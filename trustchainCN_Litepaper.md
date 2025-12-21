@@ -387,6 +387,16 @@ ConfirmService 是对某一笔结算的**最终授权**。Payer 使用 EIP-712 �
 
 规范化消息体要求与 ServiceTx 同等级别的深度绑定；ConfirmService 一旦上链消费不可撤销，若需撤销必须走 dispute/arb 流程。
 
+#### MEV 防护建议
+
+`settleWithConfirm` 交易在公开 Mempool 中可能被 MEV Bot 观察和利用。建议：
+
+| 措施 | 描述 |
+|------|------|
+| **私有提交通道** | 通过 Base Sequencer 私有 RPC 或 Flashbots Protect 提交，避免公开 Mempool |
+| **Commit-Reveal（可选）** | 高价值结算可先提交 `hash(confirm + salt)`，下一区块再 reveal |
+| **Provider 直接提交** | Provider 作为交易发起者，其利益与结算一致，降低被抢跑动机 |
+
 ### 3.4 批量结算（可选）
 
 ```solidity
@@ -784,6 +794,21 @@ function forceFinalize(bytes32 disputeId) external {
 - 双方保证金全部罚没
 
 这种设计惩罚"开启争议却不举证"的行为，避免争议机制被滥用。
+
+#### defaultOutcome 套利风险与防护
+
+**风险场景**：如果某 ArbitrationPolicy 的 `defaultOutcome = PROVIDER_WINS`，恶意 Provider 可能对仲裁节点发动 DDoS 攻击，迫使超时触发默认裁决，从而非法获益。
+
+**防护措施**：
+
+| 措施 | 描述 |
+|------|------|
+| **禁止单边有利默认值** | `defaultOutcome` 只允许 `INVALID`（双方罚没）或 `SPLIT`，禁止 `PROVIDER_WINS` / `PAYER_WINS` |
+| **多仲裁者冗余** | 同一争议分配给 N 个仲裁者（如 3/5），需多数响应才能裁决，单点 DDoS 无效 |
+| **仲裁者在线保证金** | 仲裁者质押保证金，超时未响应则罚没，激励保持在线 |
+| **备用仲裁升级** | 主仲裁者超时后，自动升级到备用仲裁模式（如 Committee → DAO 投票） |
+
+**推荐配置**：`defaultOutcome = INVALID`，确保任何超时场景都不会单边获益。
 
 **保证**：即使整个仲裁层失效，资金不会永久锁定。
 
@@ -1636,6 +1661,29 @@ struct TEEEvidence {
 | TEE 硬件安全 | Intel SGX 无已知可利用漏洞 |
 | Attestation 可用 | Intel IAS / DCAP 服务在线 |
 | Enclave 代码正确 | mrenclave 对应的代码经过审计 |
+
+#### 链上验证成本问题
+
+直接在 EVM 上验证 Intel SGX Quote 极其昂贵（可能超出 Gas Limit），因此需要**中继验证层**：
+
+```
+┌─────────────┐     attestation     ┌──────────────────┐
+│ TEE Enclave │ ──────────────────► │  Relay Verifier  │
+└─────────────┘                     │ (Automata/RISC0) │
+                                    └────────┬─────────┘
+                                             │ ZK proof (轻量)
+                                    ┌────────▼─────────┐
+                                    │  EntryPoint      │
+                                    │  (链上验证 ZK)   │
+                                    └──────────────────┘
+```
+
+**推荐方案**：
+- **Automata Network**：提供 SGX/TDX 的链上验证中继
+- **RISC Zero**：将 Attestation 验证逻辑编译为 zkVM，生成 STARK 证明
+- **自建中继**：运行可信验证节点，签名验证结果（需多签或质押机制）
+
+链上合约只需验证轻量级 ZK 证明或多签结果，Gas 成本降低 10-100 倍。
 
 #### 适用场景
 
