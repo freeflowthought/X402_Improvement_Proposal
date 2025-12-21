@@ -2218,6 +2218,35 @@ struct APIUsageReceipt {
 
 说明：`APIUsageReceipt` 属于证据模板（链下/仲裁层），链上只锚定其哈希；签名按 EIP-712 在提交时单独提供，不内嵌到 `UsageReceipt` 中。
 
+**Payer 证据自建（失败断言）**：
+
+当争议完全由 Payer 举证时，必须定义可复核、可签名的失败证据。建议 Payer SDK 自动记录 HTTP 5xx/Timeout 等失败事件并生成 EIP-712 断言，作为仲裁关键证据：
+
+```solidity
+struct APIFailureAssertion {
+    bytes32 requestId;
+    bytes32 receiptId;
+    address payer;
+    address provider;
+    bytes32 endpointHash;
+    uint64 startedAt;
+    uint64 endedAt;
+    uint64 timeoutMs;
+    uint16 httpStatus;      // 5xx 或 0（超时无状态）
+    uint8  errorType;       // TIMEOUT/HTTP_5XX/INVALID_RESPONSE
+    uint32 retryCount;
+    bytes32 requestHash;    // 请求头+体哈希
+    bytes32 responseHash;   // 响应体哈希（超时可为 0x0）
+    bytes32 clientLogHash;  // SDK 日志包哈希（含时间戳/延迟/错误码）
+    bytes payerSignature;   // EIP-712 签名
+}
+```
+
+**执行要求**：
+- SDK 在调用失败时自动生成断言并签名，写入本地不可变日志（或上传到 IPFS/Arweave）
+- `clientLogHash` 需可复现（日志包含时间戳、重试序列、延迟、错误码）
+- 仲裁时提交 `APIFailureAssertion + 日志包`，仲裁者验证签名与哈希一致性
+
 **批量验证设计**：
 
 ```

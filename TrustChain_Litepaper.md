@@ -384,6 +384,35 @@ Recommended mapping to `UsageReceipt`:
 
 Note: `APIUsageReceipt` is an off-chain evidence template. On-chain settlement anchors hashes only; signatures are submitted separately as EIP-712 data, not embedded in `UsageReceipt`.
 
+**Payer-built evidence (failure assertion)**:
+
+When disputes rely on Payer evidence, define a verifiable, signed failure record. The Payer SDK should auto-record HTTP 5xx/timeout failures and generate an EIP-712 assertion used in arbitration:
+
+```solidity
+struct APIFailureAssertion {
+    bytes32 requestId;
+    bytes32 receiptId;
+    address payer;
+    address provider;
+    bytes32 endpointHash;
+    uint64 startedAt;
+    uint64 endedAt;
+    uint64 timeoutMs;
+    uint16 httpStatus;      // 5xx or 0 for timeout
+    uint8  errorType;       // TIMEOUT/HTTP_5XX/INVALID_RESPONSE
+    uint32 retryCount;
+    bytes32 requestHash;    // request headers+body hash
+    bytes32 responseHash;   // response body hash (0x0 on timeout)
+    bytes32 clientLogHash;  // SDK log bundle hash (timestamps/latency/errors)
+    bytes payerSignature;   // EIP-712 signature
+}
+```
+
+**Execution requirements**:
+- SDK auto-signs the assertion on failure and stores an immutable log bundle (local or IPFS/Arweave)
+- `clientLogHash` must be reproducible from the log bundle
+- In arbitration, submit `APIFailureAssertion + log bundle`; arbitrators verify signature and hash consistency
+
 ### 3.3.1 ConfirmService (Fast Path Confirmation)
 
 Off-chain confirmation message for the fast path:
