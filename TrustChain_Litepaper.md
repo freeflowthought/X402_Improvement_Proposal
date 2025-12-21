@@ -220,7 +220,6 @@ TrustApp aims to:
 | **Provider** | Executes services and submits receipts |
 | **Relayer** | Optional, submits transactions on behalf of others |
 | **Arbitrator** | Executes dispute logic (committee/court/TEE/ZK) |
-| **Watcher** | Monitors, challenges, or supplies evidence |
 
 ### 2.2 Core Modules
 
@@ -350,6 +349,40 @@ struct UsageReceipt {
     bytes32 aux;          // module-specific field
 }
 ```
+
+#### APIUsageReceipt (API metering evidence template)
+
+```solidity
+struct APIUsageReceipt {
+    // === Base fields ===
+    bytes32 requestId;
+    bytes32 receiptId;
+    address payer;
+    address provider;
+    uint256 amount;
+    uint64 timestamp;
+
+    // === API metering fields ===
+    bytes32 endpointHash;
+    uint64 callCount;
+    uint64 totalUnits;
+    bytes32 firstCallHash;
+    bytes32 lastCallHash;
+    bytes32 merkleRoot;
+
+    // === Signature ===
+    bytes providerSignature;
+}
+```
+
+Recommended mapping to `UsageReceipt`:
+- `UsageReceipt.requestId/receiptId/amount` -> same-named fields
+- `UsageReceipt.responseHash` -> `APIUsageReceipt.merkleRoot`
+- `UsageReceipt.payloadHash` -> hash(endpointHash, callCount, totalUnits, firstCallHash, lastCallHash, timestamp, payer, provider, amount)
+- `UsageReceipt.startTime/endTime` -> first/last call timestamps from the call records (used to build the Merkle root)
+- `UsageReceipt.aux` -> module-defined (e.g., endpointHash or version)
+
+Note: `APIUsageReceipt` is an off-chain evidence template. On-chain settlement anchors hashes only; signatures are submitted separately as EIP-712 data, not embedded in `UsageReceipt`.
 
 ### 3.3.1 ConfirmService (Fast Path Confirmation)
 
@@ -492,9 +525,9 @@ If p = 1.5, then k >= 1.5.
 | slashMultiple | 1.5 | 150% slash |
 | minChallengeProb | 0.3 | target network quality |
 
-**Challenger incentives**
+**Payer challenge incentives**
 ```
-challengerReward > challengeCost
+payerReward > challengeCost
 arbBps * slashedAmount > c
 arbBps * p * A > c
 ```
@@ -619,17 +652,14 @@ T_dispute_max = challengeWindow + bondWindow + evidenceWindow + decisionWindow
               = 192 hours (8 days)
 ```
 
-**Probabilistic finality with n watchers**
-```
-P(caught) = 1 - (1-p)^n
-```
+**Dispute discovery assumptions**
 
-Example: p = 0.8, n = 5:
-```
-P(caught) = 1 - 0.2^5 = 99.97%
-```
+In a Payer-only challenge model, the chance of catching malicious settlements depends on:
+- Payer monitoring and willingness to challenge
+- Verifiability of evidence (e.g., TEE/ZK/Oracle)
+- challengeWindow and bond parameters matching risk
 
-Recommendation: for > $10k transactions, require at least 3 registered watchers.
+Recommendation: for high-value transactions, prefer verifiable modes (TEE/ZK/Oracle) and longer challenge windows with higher bond thresholds.
 
 **Finality summary**
 
@@ -796,7 +826,6 @@ Cost = 10 * 1000 = 10,000 USDC
 | Malicious provider | Controls own keys; can forge receipts | Get paid without service |
 | Malicious relayer | Can censor or delay tx; cannot forge signatures | MEV, denial |
 | Malicious arbitrator | Depends on arb mode | Biased decisions, bribery |
-| Malicious watcher | Can submit false challenges | Harassment, denial |
 | Network attacker | Can observe or delay tx | Front-run, sandwich |
 
 #### Out of Scope
@@ -1080,13 +1109,7 @@ Arbitrators must stake $TRUST to participate in dispute resolution:
 | Case Value Cap | Stake amount determines maximum dispute value allowed |
 | Slashing | Incorrect/malicious rulings trigger stake slashing |
 
-**2. Watcher Staking**
-
-Watchers stake $TRUST to obtain challenge rights:
-- Successful challenge: Receive share of slashed funds
-- Malicious challenge: Bond is forfeited
-
-**3. Protocol Governance**
+**2. Protocol Governance**
 
 $TRUST holders may participate in the following governance decisions:
 
@@ -1111,8 +1134,8 @@ $TRUST holders may participate in the following governance decisions:
 | Mechanism | Description |
 |-----------|-------------|
 | Buyback & Burn | Portion of protocol revenue used to buy back and burn $TRUST |
-| Slashing Burns | Portion of slashed $TRUST from arbitrators/watchers is burned |
-| Staking Demand | Arbitrators and watchers must continuously hold $TRUST |
+| Slashing Burns | Portion of slashed $TRUST from arbitrators is burned |
+| Staking Demand | Arbitrators must continuously hold $TRUST |
 
 #### 8.4.4 Scenarios NOT Using $TRUST
 
@@ -1136,7 +1159,6 @@ The $TRUST token is designed to capture value as the TrustApp ecosystem grows. U
 | Driver | Mechanism | Scaling Factor |
 |--------|-----------|----------------|
 | **Arbitrator staking** | More disputes → more arbitrators needed → more $TRUST staked | Linear with dispute volume |
-| **Watcher staking** | Higher transaction volume → more monitoring needed | Linear with transaction count |
 | **Governance participation** | More stakeholders → more governance demand | Network effect |
 | **Platform integration** | E-commerce platforms staking for premium features | Exponential with B2B adoption |
 
@@ -1175,7 +1197,7 @@ The $TRUST token is designed to capture value as the TrustApp ecosystem grows. U
                           ▼
               ┌─────────────────────────┐
               │ Attracts More Arbitrators│
-              │ & Watchers (Higher Yield)│
+              │    (Higher Yield)        │
               └───────────┬─────────────┘
                           ▼
               ┌─────────────────────────┐
@@ -1228,18 +1250,41 @@ When e-commerce platforms integrate TrustApp, the multiplier effect accelerates:
 
 **One large enterprise adoption = 100x small marketplace impact on token demand.**
 
-#### 8.4.6 Entrepreneur Benefits from Token Appreciation
+#### 8.4.6 Entrepreneur Benefits from Ecosystem Growth
 
-As entrepreneurs stake to use TrustApp services, they also benefit from ecosystem growth:
+Entrepreneurs (Providers) stake USDC to guarantee service delivery, while optionally holding $TRUST to participate in protocol governance and value capture:
 
 | Benefit | Description |
 |---------|-------------|
-| **Stake appreciation** | Provider stakes may appreciate as $TRUST value grows |
-| **Staking rewards** | Long-term stakers may earn from protocol revenue sharing |
-| **Governance influence** | Successful providers accumulate governance power |
-| **Reputation portability** | On-chain track record is verifiable across platforms |
+| **Stable service collateral** | Providers stake USDC; collateral value unaffected by token volatility |
+| **$TRUST governance rights** | Holding $TRUST enables voting on protocol parameters, fees, module approval |
+| **Become arbitrator** | Staking $TRUST allows participation in arbitration for additional income |
+| **Reputation portability** | On-chain transaction history is verifiable across platforms, reducing cold-start costs |
 
-This creates **aligned incentives**: the more entrepreneurs succeed on TrustApp, the more valuable their stakes become, incentivizing honest behavior and long-term participation.
+**Dual-Layer Participation Model**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                  Entrepreneur Participation Paths                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Service Layer (Required)          Governance Layer (Optional)  │
+│  ─────────────────────────         ───────────────────────────  │
+│  Stake USDC as service collateral  Hold $TRUST for governance   │
+│  ↓                                 ↓                            │
+│  Provide services, earn fees       Vote on protocol parameters  │
+│  ↓                                 ↓                            │
+│  Build on-chain reputation         Stake $TRUST as arbitrator   │
+│                                    ↓                            │
+│                                    Earn arbitration fee share   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+This design ensures:
+- **Service layer safety**: USDC collateral maintains stable value, unaffected by market volatility
+- **Governance layer incentives**: $TRUST holders' interests align with protocol success
+- **Optional participation**: Entrepreneurs can participate only in service layer without holding $TRUST
 
 ---
 
@@ -1452,7 +1497,7 @@ More $TRUST demand (arbitrator staking, governance)
         ↓
 Token value appreciation
         ↓
-Attracts more arbitrators and watchers
+Attracts more arbitrators
         ↓
 Better dispute resolution quality
         ↓
@@ -1578,7 +1623,7 @@ const response = await client.fetch("https://api.example.com/resource", {
 | Phase | Milestone | Goal |
 |-------|-----------|------|
 | **Phase 1** | EntryPoint + Settlement + simplified arbitration | MVP |
-| **Phase 2** | Batch receipts + Watcher network | lower gas, more oversight |
+| **Phase 2** | Batch receipts + dispute tooling | lower gas, improved dispute UX |
 | **Phase 3** | Multiple arbitration modes (TEE/ZK/Oracle) | broader coverage |
 | **Phase 4** | Module marketplace + SDK | ecosystem growth |
 | **Phase 5** | x402 compatibility + cross-chain | adoption and scale |
@@ -3003,227 +3048,7 @@ struct TierConfig {
 function getProviderTier(address provider) external view returns (uint8 tier, TierConfig memory config);
 ```
 
-### B.7 Watcher Network Specification
-
-Watchers monitor settlements and can challenge fraudulent claims. A healthy watcher network is essential for protocol security.
-
-#### Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       Watcher Network                             │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                   │
-│  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐     │
-│  │ Watcher 1 │  │ Watcher 2 │  │ Watcher 3 │  │ Watcher N │     │
-│  │ (Full)    │  │ (Light)   │  │ (Full)    │  │ (Light)   │     │
-│  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘     │
-│        │              │              │              │            │
-│        └──────────────┼──────────────┼──────────────┘            │
-│                       │              │                           │
-│                ┌──────▼──────┐┌──────▼──────┐                    │
-│                │  Event      ││  Challenge  │                    │
-│                │  Indexer    ││  Coordinator│                    │
-│                └──────┬──────┘└──────┬──────┘                    │
-│                       │              │                           │
-│                       └──────┬───────┘                           │
-│                              │                                   │
-│                       ┌──────▼──────┐                            │
-│                       │  Watcher    │                            │
-│                       │  Registry   │                            │
-│                       └─────────────┘                            │
-│                                                                   │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-#### Watcher Types
-
-| Type | Responsibility | Stake Requirement | Reward Share |
-|------|---------------|-------------------|--------------|
-| **Full Watcher** | Indexes all settlements, validates receipts, initiates challenges | 10,000 USDC | 70% of challenger reward |
-| **Light Watcher** | Monitors specific providers or modules, reports to Full Watchers | 1,000 USDC | 20% of challenger reward |
-| **Delegated Watcher** | Receives delegation from token holders, shares rewards | Variable | Based on delegation |
-
-#### Interface Definition
-
-```solidity
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
-
-interface IWatcherRegistry {
-
-    /// @notice Watcher status
-    enum WatcherStatus {
-        INACTIVE,
-        ACTIVE,
-        SUSPENDED,
-        EXITING     // In unbonding period
-    }
-
-    /// @notice Watcher type
-    enum WatcherType {
-        FULL,
-        LIGHT,
-        DELEGATED
-    }
-
-    /// @notice Watcher profile
-    struct WatcherProfile {
-        address watcherAddress;
-        bytes32 watcherId;
-        WatcherType watcherType;
-        WatcherStatus status;
-        uint256 stake;
-        uint256 delegatedStake;
-        uint64 registeredAt;
-        uint64 lastActiveAt;
-        uint32 successfulChallenges;
-        uint32 failedChallenges;
-        uint256 totalRewards;
-        bytes32[] watchedModules;    // Modules this watcher monitors
-        address[] watchedProviders;  // Specific providers to monitor
-    }
-
-    /// @notice Challenge record
-    struct ChallengeRecord {
-        bytes32 challengeId;
-        bytes32 settlementId;
-        address watcher;
-        uint64 timestamp;
-        bool successful;
-        uint256 reward;
-    }
-
-    // ============ Registration ============
-
-    /// @notice Register as a watcher
-    function registerWatcher(
-        WatcherType watcherType,
-        bytes32[] calldata watchedModules
-    ) external payable returns (bytes32 watcherId);
-
-    /// @notice Add stake
-    function addStake(uint256 amount) external;
-
-    /// @notice Request unstake (starts unbonding)
-    function requestUnstake(uint256 amount) external;
-
-    /// @notice Complete unstake after unbonding period
-    function unstake() external;
-
-    /// @notice Update watched modules
-    function updateWatchedModules(bytes32[] calldata modules) external;
-
-    /// @notice Add specific provider to watch list
-    function addWatchedProvider(address provider) external;
-
-    // ============ Delegation ============
-
-    /// @notice Delegate stake to a watcher
-    function delegate(address watcher, uint256 amount) external;
-
-    /// @notice Undelegate stake
-    function undelegate(address watcher, uint256 amount) external;
-
-    /// @notice Get total delegated to watcher
-    function getDelegatedStake(address watcher) external view returns (uint256);
-
-    // ============ Challenge ============
-
-    /// @notice Report suspicious settlement
-    function reportSuspicious(
-        bytes32 settlementId,
-        bytes calldata evidence
-    ) external returns (bytes32 reportId);
-
-    /// @notice Record challenge outcome (called by Arbitration)
-    function recordChallengeOutcome(
-        bytes32 challengeId,
-        address watcher,
-        bool successful,
-        uint256 reward
-    ) external;
-
-    // ============ Queries ============
-
-    /// @notice Get watcher profile
-    function getWatcher(address watcher) external view returns (WatcherProfile memory);
-
-    /// @notice Check if watcher is active
-    function isWatcherActive(address watcher) external view returns (bool);
-
-    /// @notice Get active watchers for a module
-    function getWatchersForModule(bytes32 moduleId) external view returns (address[] memory);
-
-    /// @notice Get challenge history
-    function getChallengeHistory(address watcher) external view returns (ChallengeRecord[] memory);
-
-    // ============ Coverage Metrics ============
-
-    /// @notice Get watcher coverage for a settlement amount
-    function getWatcherCoverage(uint256 amount) external view returns (
-        uint8 watcherCount,
-        uint256 totalStake,
-        bool sufficientCoverage
-    );
-
-    /// @notice Minimum watchers required for settlement amount
-    function requiredWatchers(uint256 amount) external view returns (uint8);
-
-    // ============ Rewards ============
-
-    /// @notice Claim accumulated rewards
-    function claimRewards() external returns (uint256);
-
-    /// @notice Get pending rewards
-    function pendingRewards(address watcher) external view returns (uint256);
-}
-```
-
-#### Watcher Incentive Model
-
-```
-Challenge Reward Distribution:
-
-┌─────────────────────────────────────────────────────────────────┐
-│                    Slashed Amount (S)                            │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐        │
-│  │ Payer (50%)   │  │Challenger(20%)│  │ Protocol(30%) │        │
-│  └───────────────┘  └───────┬───────┘  └───────────────┘        │
-│                             │                                    │
-│                             ▼                                    │
-│                  ┌─────────────────────┐                         │
-│                  │  Challenger Reward  │                         │
-│                  │    Distribution     │                         │
-│                  └─────────┬───────────┘                         │
-│                            │                                     │
-│           ┌────────────────┼────────────────┐                    │
-│           ▼                ▼                ▼                    │
-│    ┌────────────┐   ┌────────────┐   ┌────────────┐             │
-│    │ Initiator  │   │ Full       │   │ Light      │             │
-│    │ (40%)      │   │ Watchers   │   │ Watchers   │             │
-│    │            │   │ (40%)      │   │ (20%)      │             │
-│    └────────────┘   └────────────┘   └────────────┘             │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-#### Coverage Requirements
-
-High-value settlements require minimum watcher coverage:
-
-| Settlement Amount | Min Watchers | Min Total Stake |
-|------------------|--------------|-----------------|
-| < 1,000 USDC | 1 | 5,000 USDC |
-| 1,000 - 10,000 USDC | 2 | 20,000 USDC |
-| 10,000 - 100,000 USDC | 3 | 100,000 USDC |
-| > 100,000 USDC | 5 | 500,000 USDC |
-
-If coverage is insufficient, settlement enters extended challenge window (2x normal).
-
-### B.8 Event Log Definitions
+### B.7 Event Log Definitions
 
 Complete event definitions for off-chain indexing and monitoring:
 
@@ -3423,45 +3248,6 @@ event ReputationUpdated(
     address indexed provider,
     uint16 oldScore,
     uint16 newScore
-);
-
-// ============ WatcherRegistry Events ============
-
-event WatcherRegistered(
-    address indexed watcher,
-    bytes32 indexed watcherId,
-    IWatcherRegistry.WatcherType watcherType
-);
-
-event WatcherStakeChanged(
-    address indexed watcher,
-    uint256 oldStake,
-    uint256 newStake
-);
-
-event SuspiciousReported(
-    bytes32 indexed reportId,
-    bytes32 indexed settlementId,
-    address indexed watcher
-);
-
-event ChallengeRecorded(
-    bytes32 indexed challengeId,
-    address indexed watcher,
-    bool successful,
-    uint256 reward
-);
-
-event RewardsClaimed(
-    address indexed watcher,
-    uint256 amount
-);
-
-event DelegationChanged(
-    address indexed delegator,
-    address indexed watcher,
-    uint256 amount,
-    bool isDelegation  // true = delegate, false = undelegate
 );
 
 // ============ Registry Events ============
@@ -3817,7 +3603,6 @@ Based on Base (L2) gas costs. Estimates assume typical contract sizes and storag
 | **Unstake Request** | 55,000 | ~$0.001 | Start cooldown |
 | **Slash** | 180,000 | ~$0.003 | Slash + distribute |
 | **Register Provider** | 200,000 | ~$0.003 | Full registration |
-| **Register Watcher** | 150,000 | ~$0.002 | Watcher registration |
 
 ### E.2 Cost Comparison: Single vs Batch Settlement
 
@@ -3862,10 +3647,10 @@ Full dispute resolution costs:
 
 | Party | Action | Gas | Cost |
 |-------|--------|-----|------|
-| **Challenger** | Open dispute | 180,000 | ~$0.003 |
-| **Challenger** | Submit bond | (included) | - |
+| **Payer** | Open dispute | 180,000 | ~$0.003 |
+| **Payer** | Submit bond | (included) | - |
 | **Provider** | Submit bond | 65,000 | ~$0.001 |
-| **Challenger** | Submit evidence | 95,000 | ~$0.002 |
+| **Payer** | Submit evidence | 95,000 | ~$0.002 |
 | **Provider** | Submit evidence | 95,000 | ~$0.002 |
 | **Arbitrator** | Submit decision | 140,000 | ~$0.002 |
 | **System** | Execute decision | 160,000 | ~$0.003 |
@@ -3923,7 +3708,6 @@ Full dispute resolution costs:
 | **CEE** | Credit Execution Environment |
 | **TEE** | Trusted Execution Environment |
 | **ZK** | Zero Knowledge |
-| **Watcher** | Monitors and challenges settlements |
 | **Facilitator** | x402 settlement coordinator (replaced by contracts) |
 | **arbMode** | Arbitration mode |
 | **defaultOutcome** | Default decision on timeout |
@@ -3940,7 +3724,7 @@ Full dispute resolution costs:
 - v0.1: initial draft
 - v0.2: added arbitration flow details
 - v0.3: added security model, game analysis, x402 migration, finality bounds, Sybil defense
-- v0.4: expanded Oracle arbitration mode, added ProviderRegistry and Watcher network specs, complete interface definitions, Gas cost analysis and Merkle batch settlement
+- v0.4: expanded Oracle arbitration mode, added ProviderRegistry, complete interface definitions, Gas cost analysis and Merkle batch settlement
 - v0.4.1: fixed section numbering, expanded glossary, added MEV/cross-chain/ConfirmService security notes, added contract code disclaimer
 
 *TrustApp Protocol - Trust as a Service for the Decentralized Service Economy*
