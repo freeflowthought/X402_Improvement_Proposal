@@ -761,7 +761,7 @@ function forceFinalize(bytes32 disputeId) external {
         block.timestamp > d.decisionDeadline + GRACE_PERIOD,
         "Grace period not passed"
     );
-    
+
     // 裁决逻辑
     if (d.providerEvidenceValid && !d.payerEvidenceValid) {
         // Provider 提交了有效收据签名
@@ -770,11 +770,20 @@ function forceFinalize(bytes32 disputeId) external {
         // Payer 提交了服务失败证明
         _executeDecision(disputeId, Outcome.PAYER_WINS);
     } else {
-        // 否则按 defaultOutcome（通常 50/50 split）
-        _executeDecision(disputeId, Outcome.SPLIT);
+        // 双方都无有效证据 → 视为无效争议，资金罚没入国库
+        _executeDecision(disputeId, Outcome.INVALID);
     }
 }
 ```
+
+**无效争议（INVALID）处理**：
+
+当双方均未提交有效证据时，不应简单 50/50 分账（这会激励恶意争议），而应：
+- 争议金额的 **liquidateBps**（如 50%-100%）罚没进入协议国库或仲裁基金
+- 剩余部分（如有）按比例退还
+- 双方保证金全部罚没
+
+这种设计惩罚"开启争议却不举证"的行为，避免争议机制被滥用。
 
 **保证**：即使整个仲裁层失效，资金不会永久锁定。
 

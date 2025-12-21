@@ -648,12 +648,22 @@ function forceFinalize(bytes32 disputeId) external {
     } else if (d.payerEvidenceValid && !d.providerEvidenceValid) {
         _executeDecision(disputeId, Outcome.PAYER_WINS);
     } else {
-        _executeDecision(disputeId, Outcome.SPLIT);
+        // Neither party submitted valid evidence → invalid dispute, liquidate to treasury
+        _executeDecision(disputeId, Outcome.INVALID);
     }
 }
 ```
 
-Guarantee: even if the arbitration layer fails, funds do not stay locked forever.
+**Invalid Dispute (INVALID) Handling**:
+
+When neither party submits valid evidence, a simple 50/50 split would incentivize frivolous disputes. Instead:
+- **liquidateBps** (e.g., 50%-100%) of the disputed amount is liquidated to the protocol treasury or arbitration fund
+- Any remainder (if applicable) returned proportionally
+- Both parties' bonds are fully slashed
+
+This design penalizes "open dispute then do nothing" behavior and prevents abuse of the dispute mechanism.
+
+**Guarantee**: Even if the arbitration layer fails, funds do not stay locked forever.
 
 ---
 
