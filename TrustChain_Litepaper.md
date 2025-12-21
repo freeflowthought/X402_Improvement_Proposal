@@ -39,8 +39,14 @@ This paper describes TrustApp's architecture, transaction and receipt formats, a
 6. [Economic Model and Incentives](#6-economic-model-and-incentives)
 7. [Security Model and Trust Assumptions](#7-security-model-and-trust-assumptions)
 8. [Governance and Upgrades](#8-governance-and-upgrades)
+   - [8.4.5 Token Value and Platform Adoption Flywheel](#845-token-value-and-platform-adoption-flywheel)
+   - [8.4.6 Entrepreneur Benefits from Token Appreciation](#846-entrepreneur-benefits-from-token-appreciation)
 9. [Typical Applications](#9-typical-applications)
-10. [x402 Migration Path](#10-x402-migration-path)
+   - [9.5 Decentralized Alipay for E-commerce Platforms (B2B)](#95-decentralized-alipay-for-e-commerce-platforms-b2b)
+   - [9.6 Agent-to-Agent Economy (A2A Transactions)](#96-agent-to-agent-economy-a2a-transactions)
+   - [9.7 Trust as a Service (TaaS) for Entrepreneurs](#97-trust-as-a-service-taas-for-entrepreneurs)
+10. [x402 Migration Path and Standalone Deployment](#10-x402-migration-path-and-standalone-deployment)
+    - [10.0 TrustApp as a Standalone Protocol](#100-trustapp-as-a-standalone-protocol)
 11. [Roadmap](#11-roadmap)
 12. [Conclusion](#12-conclusion)
 
@@ -1119,6 +1125,122 @@ The following scenarios explicitly use stablecoins to avoid token volatility aff
 | Service Pricing & Settlement | USDC | Costs require certainty |
 | Dispute Compensation | USDC | Compensation amounts must be stable |
 
+#### 8.4.5 Token Value and Platform Adoption Flywheel
+
+**Why $TRUST Appreciates with Adoption**:
+
+The $TRUST token is designed to capture value as the TrustApp ecosystem grows. Unlike pure utility tokens, $TRUST benefits from multiple demand drivers tied to platform usage.
+
+**Demand Drivers**:
+
+| Driver | Mechanism | Scaling Factor |
+|--------|-----------|----------------|
+| **Arbitrator staking** | More disputes → more arbitrators needed → more $TRUST staked | Linear with dispute volume |
+| **Watcher staking** | Higher transaction volume → more monitoring needed | Linear with transaction count |
+| **Governance participation** | More stakeholders → more governance demand | Network effect |
+| **Platform integration** | E-commerce platforms staking for premium features | Exponential with B2B adoption |
+
+**Value Accrual Model**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    TrustApp Ecosystem Growth                     │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+        ┌──────────────────┼──────────────────┐
+        ▼                  ▼                  ▼
+┌───────────────┐  ┌───────────────┐  ┌───────────────┐
+│  Transaction  │  │   Dispute     │  │   Platform    │
+│    Volume     │  │    Volume     │  │  Integrations │
+└───────┬───────┘  └───────┬───────┘  └───────┬───────┘
+        │                  │                  │
+        ▼                  ▼                  ▼
+┌───────────────┐  ┌───────────────┐  ┌───────────────┐
+│ Protocol Fee  │  │  Arbitration  │  │  B2B Staking  │
+│   Revenue     │  │    Demand     │  │    Demand     │
+└───────┬───────┘  └───────┬───────┘  └───────┬───────┘
+        │                  │                  │
+        └──────────────────┼──────────────────┘
+                           ▼
+              ┌─────────────────────────┐
+              │   $TRUST Demand Increase │
+              │   - Buyback & Burn       │
+              │   - Staking Requirements │
+              │   - Governance Power     │
+              └───────────┬─────────────┘
+                          ▼
+              ┌─────────────────────────┐
+              │    Token Appreciation    │
+              └───────────┬─────────────┘
+                          ▼
+              ┌─────────────────────────┐
+              │ Attracts More Arbitrators│
+              │ & Watchers (Higher Yield)│
+              └───────────┬─────────────┘
+                          ▼
+              ┌─────────────────────────┐
+              │ Better Dispute Resolution│
+              │  → More User Trust       │
+              └───────────┬─────────────┘
+                          ▼
+              ┌─────────────────────────┐
+              │  More Transactions &     │
+              │  Platform Integrations   │
+              └─────────────────────────┘
+                    (Flywheel continues)
+```
+
+**Quantitative Model (Illustrative)**:
+
+Assume:
+- Daily transaction volume: V (USDC)
+- Protocol fee: 0.3%
+- Buyback allocation: 50% of fees
+- Dispute rate: 1%
+- Arbitrator yield target: 10% APY
+
+```
+Daily protocol revenue = V * 0.003
+Daily buyback = V * 0.003 * 0.5 = V * 0.0015
+Annual buyback = V * 0.0015 * 365 = V * 0.5475
+
+If V = $10M/day:
+  Annual buyback pressure = $5.475M
+
+Required arbitrator stake (for 1% dispute rate):
+  Dispute volume = V * 0.01 = $100K/day
+  Arbitrator stake needed ≈ 3x dispute value = $300K staked
+  For 10% APY, arbitrators earn $30K/year from this stake
+
+Total $TRUST demand = buyback + staking = structural appreciation
+```
+
+**B2B Multiplier Effect**:
+
+When e-commerce platforms integrate TrustApp, the multiplier effect accelerates:
+
+| Platform Size | Daily Volume | Annual Buyback | Arbitrator Stake |
+|---------------|--------------|----------------|------------------|
+| Small marketplace | $100K | $54.75K | $3K |
+| Medium marketplace | $1M | $547.5K | $30K |
+| Large marketplace | $10M | $5.475M | $300K |
+| Enterprise platform | $100M | $54.75M | $3M |
+
+**One large enterprise adoption = 100x small marketplace impact on token demand.**
+
+#### 8.4.6 Entrepreneur Benefits from Token Appreciation
+
+As entrepreneurs stake to use TrustApp services, they also benefit from ecosystem growth:
+
+| Benefit | Description |
+|---------|-------------|
+| **Stake appreciation** | Provider stakes may appreciate as $TRUST value grows |
+| **Staking rewards** | Long-term stakers may earn from protocol revenue sharing |
+| **Governance influence** | Successful providers accumulate governance power |
+| **Reputation portability** | On-chain track record is verifiable across platforms |
+
+This creates **aligned incentives**: the more entrepreneurs succeed on TrustApp, the more valuable their stakes become, incentivizing honest behavior and long-term participation.
+
 ---
 
 ## 9. Typical Applications
@@ -1162,11 +1284,205 @@ The following scenarios explicitly use stablecoins to avoid token volatility aff
 
 **Arbitration mode**: TEE or ZK
 
+### 9.5 Decentralized Alipay for E-commerce Platforms (B2B)
+
+TrustApp enables any e-commerce platform to build its own **decentralized escrow and arbitration system**—essentially a "Decentralized Alipay" without centralized control.
+
+**Value Proposition for Platforms**:
+
+| Traditional Approach | TrustApp Approach |
+|---------------------|-------------------|
+| Build custom escrow system | Use TrustApp contracts as infrastructure |
+| Hire arbitration staff | Plug into decentralized arbitration network |
+| Bear regulatory risk | Neutral protocol, transparent rules |
+| Limited to domestic jurisdiction | Cross-border enforcement via economic penalties |
+| High operational cost | Pay-per-use protocol fees |
+
+**Integration Model**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    E-commerce Platform                           │
+│  (Shopify, WooCommerce, Custom Marketplace)                     │
+├─────────────────────────────────────────────────────────────────┤
+│                     TrustApp SDK Layer                           │
+│  - Escrow management       - Receipt generation                  │
+│  - Dispute handling        - Settlement automation               │
+├─────────────────────────────────────────────────────────────────┤
+│                    TrustApp Protocol (Base)                      │
+│  EntryPoint | Settlement | Arbitration | StakePool               │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Business Model for Platform Operators**:
+
+| Revenue Stream | Description |
+|----------------|-------------|
+| **Platform fee markup** | Add platform margin on top of TrustApp protocol fee |
+| **Premium arbitration** | Offer faster/specialized arbitration at higher rates |
+| **Staking services** | Help merchants stake and earn arbitration participation rewards |
+| **White-label solution** | License customized TrustApp integration to other platforms |
+
+**Flow**:
+1. Platform integrates TrustApp SDK
+2. Buyer purchases product; funds locked in TrustApp escrow
+3. Seller ships product; logistics oracle confirms delivery
+4. Auto-settlement on confirmation; or dispute → arbitration
+5. Platform earns fee on each successful transaction
+
+**Arbitration mode**: Oracle (logistics) + Committee (quality disputes)
+
+**Example Deployment**:
+- A Southeast Asian marketplace integrates TrustApp
+- Cross-border sellers from China can serve buyers in Indonesia
+- No need for local payment licenses—TrustApp handles escrow
+- Disputes resolved by decentralized arbitrators, not platform staff
+- Platform focuses on customer acquisition, not payment infrastructure
+
+### 9.6 Agent-to-Agent Economy (A2A Transactions)
+
+As AI agents increasingly perform autonomous transactions, TrustApp provides the **trust layer for agent-to-agent commerce**.
+
+**The Agent Economy Challenge**:
+
+| Challenge | Without TrustApp | With TrustApp |
+|-----------|------------------|---------------|
+| Agent A pays Agent B for service | No recourse if B fails | Escrow + arbitration |
+| Billing accuracy | Trust B's metering | Verifiable receipts |
+| Quality disputes | No resolution path | Committee/ZK arbitration |
+| Agent reputation | Subjective, gameable | Stake-backed economic accountability |
+
+**A2A Transaction Flow**:
+
+```
+┌──────────────┐                              ┌──────────────┐
+│   Agent A    │                              │   Agent B    │
+│  (Consumer)  │                              │  (Provider)  │
+└──────┬───────┘                              └──────┬───────┘
+       │  1. ServiceRequest (signed)                 │
+       │────────────────────────────────────────────►│
+       │                                             │
+       │  2. Execute service (off-chain)             │
+       │◄────────────────────────────────────────────│
+       │                                             │
+       │  3. UsageReceipt                            │
+       │◄────────────────────────────────────────────│
+       │                                             │
+       │  4. ConfirmService (if satisfied)           │
+       │────────────────────────────────────────────►│
+       │                                             │
+       ▼                                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    TrustApp Settlement                       │
+│  - Verify signatures                                         │
+│  - Execute payment                                           │
+│  - Handle disputes if ConfirmService not received            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Agent Staking and Trust Tiers**:
+
+| Trust Tier | Stake Requirement | Transaction Limit | Use Case |
+|------------|-------------------|-------------------|----------|
+| **Tier 0** | None | $10/tx | Demo, testing |
+| **Tier 1** | 100 USDC | $1,000/tx | Personal agents |
+| **Tier 2** | 1,000 USDC | $10,000/tx | Business agents |
+| **Tier 3** | 10,000 USDC | $100,000/tx | Enterprise agents |
+
+**Revenue Model for Agent Operators**:
+- Agent B (provider) charges service fees per transaction
+- TrustApp protocol takes small percentage (0.3%)
+- Agent B stakes $TRUST or USDC to enable higher transaction limits
+- Successful track record reduces stake requirements over time
+
+**Arbitration mode**: TEE (verifiable compute) or ZK (provable execution)
+
+### 9.7 Trust as a Service (TaaS) for Entrepreneurs
+
+TrustApp enables a new category: **Trust as a Service**—allowing millions of entrepreneurs to offer verified, trustworthy services without building their own trust infrastructure.
+
+**The Entrepreneur's Problem**:
+
+Traditional trust-building is expensive:
+- Building reputation takes years
+- Payment processors require business history
+- Escrow services have high minimums
+- Cross-border commerce is complex
+
+**TrustApp as Trust Infrastructure**:
+
+| Entrepreneur Type | Traditional Barrier | TrustApp Solution |
+|-------------------|--------------------|--------------------|
+| **Freelance developer** | Client doesn't trust unknown contractor | Stake-backed delivery guarantee |
+| **Small manufacturer** | Buyer fears non-delivery | Escrow + logistics oracle |
+| **AI service provider** | Users doubt compute accuracy | TEE/ZK verified execution |
+| **Content creator** | Buyers fear quality issues | Committee arbitration |
+
+**How Entrepreneurs Use TrustApp**:
+
+1. **Instant trust establishment**: Stake collateral → immediately eligible for verified transactions
+2. **No reputation cold-start**: Economic stake replaces reputation requirement
+3. **Global reach**: Cross-border transactions without local licenses
+4. **Dispute protection**: Arbitration protects honest providers too
+
+**Business Model—The "Trust Tax"**:
+
+Entrepreneurs pay for trust:
+
+| Cost Component | Rate | Purpose |
+|----------------|------|---------|
+| Protocol fee | 0.3% per settlement | Protocol maintenance |
+| Stake requirement | 1.5-3x transaction value | Economic security |
+| Arbitration fee | 0.5-2% (only if disputed) | Dispute resolution |
+
+**Net benefit**: Even with these costs, entrepreneurs gain access to customers who would never transact without trust guarantees.
+
+**Ecosystem Growth and Token Value**:
+
+As more entrepreneurs use TrustApp:
+
+```
+More entrepreneurs stake
+        ↓
+More transactions secured
+        ↓
+More protocol fees generated
+        ↓
+More $TRUST demand (arbitrator staking, governance)
+        ↓
+Token value appreciation
+        ↓
+Attracts more arbitrators and watchers
+        ↓
+Better dispute resolution quality
+        ↓
+More entrepreneurs trust the system
+        ↓
+(Flywheel continues)
+```
+
+**Arbitration mode**: Varies by service type (see Mode Selection Guide)
+
 ---
 
-## 10. x402 Migration Path
+## 10. x402 Migration Path and Standalone Deployment
 
-TrustApp provides a compatibility layer for existing x402 users.
+### 10.0 TrustApp as a Standalone Protocol
+
+**TrustApp does not require x402**. While TrustApp can enhance x402-based payment flows, it is a fully independent protocol that provides value on its own:
+
+| Deployment Mode | Description | Use Case |
+|-----------------|-------------|----------|
+| **Standalone TrustApp** | Full protocol without x402 | E-commerce, B2B services, agent networks |
+| **TrustApp + x402** | x402 for payment trigger, TrustApp for enforcement | API billing with existing x402 infrastructure |
+| **TrustApp + Custom Integration** | Direct SDK/contract integration | Enterprise platforms, custom marketplaces |
+
+**Why Standalone Works**:
+- TrustApp's core value is **trust infrastructure**, not payment triggering
+- Any payment method (direct transfer, escrow, subscription) can use TrustApp's verification and arbitration
+- x402 is one possible payment trigger; TrustApp works equally well with direct contract calls, SDK integrations, or custom protocols
+
+TrustApp also provides a compatibility layer for existing x402 users who want to progressively add trust guarantees.
 
 ### 10.1 HTTP Header Extensions
 
