@@ -66,6 +66,8 @@ In a simple transfer where Alice sends funds to Bob, the blockchain only proves 
 | **Centralized arbitration is opaque** | Rules are unclear, costs are high, and cross-border enforcement is weak |
 | **Off-chain verification is hard** | Smart contracts cannot verify off-chain events without pluggable proof and arbitration |
 
+Web2 already uses escrow + arbitration. For example, Alipay and similar platforms provide dispute resolution and can arbitrate delivery issues. This validates the business need, but it also highlights the dependency: the rules, evidence standards, and outcomes are controlled by a single platform and limited by jurisdiction. TrustApp brings the same concept to a neutral, verifiable settlement layer so procedures are transparent, composable, and enforceable across borders without trusting one operator.
+
 ### 1.3 Why Existing Approaches Are Insufficient
 
 #### Structural limits of x402
@@ -1113,13 +1115,15 @@ Stage 3: arbitration, full enforcement
 ```
 Client -> Server: GET /resource
 Server -> Client: 402 Payment Required + X-TRUSTAPP-SUPPORTED
-Client -> TrustApp: deposit(amount)
+Client -> TrustApp (contracts/network): deposit(amount)
 Client -> Server: GET /resource + X-PAYMENT + X-TRUSTAPP-REQUEST
-Server -> TrustApp: verify request
+Server -> TrustApp (contracts/network): verify request (on-chain)
 Server: execute service
 Server -> Client: 200 OK + X-TRUSTAPP-RECEIPT
-Server -> TrustApp: settle(receipt)
+Server -> TrustApp (contracts/network): settle(receipt, on-chain)
 ```
+
+Note: TrustApp here refers to decentralized contracts/validators, not a centralized server.
 
 ### 10.4 SDK Compatibility Layer
 
